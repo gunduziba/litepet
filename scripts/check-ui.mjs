@@ -1,15 +1,17 @@
 #!/usr/bin/env node
 // UI 检查：ui/ 下的脚本既没有构建步骤，也没有别的自动化入口。
 //
-// 两项检查：
+// 三项检查：
 // 1. snake_case 字段 lint——Rust 侧所有发给前端的结构体都是 `rename_all = "camelCase"`，
 //    但 JS 里很容易顺手写成结构体的 Rust 字段名。这个错已经真发生过 5 次
 //    （`display_name`/`spritesheet_path`/`always_on_top`/`device_key`）。
-// 2. 把 ui/config.js 真的跑一遍。用一套最小 DOM 替身执行页面逻辑，喂进去的是从真 daemon
+// 2. CSS 静态检查：双斜杠注释、用了未定义的 `var(--x)`。这两条都真发生过。
+// 3. 把 ui/config.js 真的跑一遍。用一套最小 DOM 替身执行页面逻辑，喂进去的是从真 daemon
 //    `config/get` / `pet/list` 抄回来的原样 JSON——字段名对不对由它说了算。
 //    已漏过两次：`append()` 链式赋值崩溃、字段名写错。
 //
-// 它检查不了样式与布局，只检查「会不会抛、字段名对不对、发出去的补丁有没有越界」。
+// 它检查不了视觉与布局（那由 preview-ui.mjs 用真浏览器查），
+// 只检查「会不会抛、字段名对不对、CSS 有没有写坏、补丁有没有越界」。
 //
 // 用法：node scripts/check-ui.mjs [被检查的 config.js 路径]
 
@@ -17,59 +19,12 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
+import { CONFIG_GET, PET_LIST, respond } from './ui-fixture.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const scriptPath = process.argv[2] ?? join(root, 'ui', 'config.js');
 const html = readFileSync(join(root, 'ui', 'config.html'), 'utf8');
 const code = readFileSync(scriptPath, 'utf8');
-
-/** 真实 `config/get` 返回（`notify` 段照抄，`port` 是当时实际值）。 */
-const CONFIG_GET = {
-  config: {
-    alwaysOnTop: true,
-    notify: {
-      desktop: { enabled: true },
-      enabled: true,
-      push: { deviceKey: '', enabled: false, endpoint: null, provider: 'bark' },
-      sound: { enabled: true, volume: 0.35 },
-    },
-    pet: null,
-    port: 4590,
-    size: 220,
-    x: null,
-    y: null,
-  },
-  home: '/Users/eee/.litepet',
-  justCreated: false,
-  log: '/Users/eee/.litepet/logs/daemon.log',
-  petsRoot: '/Users/eee/.litepet/pets',
-  version: '0.1.0',
-};
-
-/** 真实 `pet/list` 返回：一个正常包（巡检喵）+ 一个坏包。 */
-const PET_LIST = {
-  current: 'xunjian-miao',
-  pets: [
-    {
-      description: '机警又耐心的黑猫巡检员，陪你定位根因、审查改动、守护每一次交付。',
-      dir: 'xunjian-miao',
-      displayName: '巡检喵',
-      frame: { columns: 8, height: 208, rows: 11, width: 192 },
-      id: 'xunjian-miao',
-      problem: null,
-      spritesheetPath: '/Users/eee/.litepet/pets/xunjian-miao/spritesheet.webp',
-    },
-    {
-      description: '',
-      dir: 'broken-pack',
-      displayName: 'broken-pack',
-      frame: null,
-      id: 'broken-pack',
-      problem: '图集缺 spritesheet 字段',
-      spritesheetPath: null,
-    },
-  ],
-};
 
 /** 最小元素替身：只实现 config.js 用到的那部分 DOM。 */
 class El {
@@ -161,23 +116,6 @@ for (const match of html.matchAll(/<[^>]*\bid="([^"]+)"[^>]*>/g)) {
 }
 
 const sent = [];
-function respond(method, params) {
-  switch (method) {
-    case 'config/get':
-      return CONFIG_GET;
-    case 'pet/list':
-      return PET_LIST;
-    case 'pet/select':
-      return { id: params.id };
-    case 'config/set':
-      return { config: { ...CONFIG_GET.config, ...params }, restartRequired: [] };
-    case 'notify/test':
-      return { sound: '默认音效', desktop: true, push: false };
-    default:
-      throw new Error(`设置页调了未预期的 RPC：${method}`);
-  }
-}
-
 const sandbox = {
   window: {
     __TAURI__: {
@@ -224,6 +162,25 @@ for (const name of readdirSync(join(root, 'ui')).filter((file) => file.endsWith(
       );
     }
   });
+}
+
+// 第 2 项：CSS 静态检查。浏览器能容忍的错误写法没那么无害：
+// `config.css` 曾以四行双斜杠开头，那不是 CSS 注释，解析器会把它当成一个选择器，
+// 然后丢掉紧随其后的整个块——正好是 `:root`，于是全部 `var(--x)` 失效，
+// 页面变成白底黑字。这两条不用开浏览器就能拦下。
+const stripComments = (source) =>
+  source.replace(/\/\*[\s\S]*?\*\//g, (block) => block.replace(/[^\n]/g, ' '));
+for (const name of readdirSync(join(root, 'ui')).filter((file) => file.endsWith('.css'))) {
+  const source = stripComments(readFileSync(join(root, 'ui', name), 'utf8'));
+  source.split('\n').forEach((line, index) => {
+    if (!/^\s*\/\//.test(line)) return;
+    check(false, `ui/${name}:${index + 1} CSS 里没有双斜杠注释——会把后面的块整个丢掉`);
+  });
+  const defined = new Set([...source.matchAll(/(--[a-z0-9-]+)\s*:/g)].map((m) => m[1]));
+  for (const [, variable, fallback] of source.matchAll(/var\(\s*(--[a-z0-9-]+)\s*(,)?/g)) {
+    if (defined.has(variable) || fallback) continue;
+    check(false, `ui/${name} 用了未定义且无兜底值的变量 ${variable}——整条声明会失效`);
+  }
 }
 
 vm.runInContext(code, sandbox, { filename: scriptPath });
@@ -294,4 +251,4 @@ if (failures.length) {
   for (const failure of failures) console.error(`  ✗ ${failure}`);
   process.exit(1);
 }
-console.log('UI 检查通过：snake_case lint 干净，设置页渲染/字段名/补丁范围/测试提醒均正常。');
+console.log('UI 检查通过：snake_case lint、CSS 注释与变量、设置页渲染/字段名/补丁范围/测试提醒均正常。');
