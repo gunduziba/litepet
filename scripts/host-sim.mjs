@@ -35,6 +35,7 @@ const METHOD = {
   hostBye: 'host/bye',
   agentStart: 'agent/start',
   agentEnd: 'agent/end',
+  agentSettled: 'agent/settled',
   toolStart: 'tool/start',
   toolEnd: 'tool/end',
   petBubble: 'pet/bubble',
@@ -228,6 +229,12 @@ async function main() {
 
   await notify(METHOD.agentEnd, { host, sessionId: 'sess-sim-1', success: true });
   await sleep(step * 2);
+
+  // 真宿主的顺序是 agent.end 紧跟着 agent.settled（pi 的 agent_end → agent_settled）。
+  // 两者都必须发：agent.end 只说明「本轮完了」，agent.settled 才说明「不会再自己接着干」。
+  // 默认提醒（出声 + 系统通知）挂在后者上，所以漏掉它就等于没验证提醒链路。
+  await notify(METHOD.agentSettled, { host, sessionId: 'sess-sim-1' });
+  await sleep(step);
 
   if (keepAlive) {
     console.log('保持心跳中，Ctrl-C 结束');

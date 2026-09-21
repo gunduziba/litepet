@@ -11,21 +11,22 @@
 //! 与具体请求无关的空转（气泡过期、进入 `resting`、linger 到期、回收死宿主）
 //! 走 [`Session::tick`]，由后台线程按 [`Session::next_deadline`] 的节奏驱动。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
+use crate::alert::Request;
 use crate::arbiter::{Arbiter, FEEDBACK_MS};
 use crate::behavior::{Behavior, Event, Resolution};
 use crate::jsonrpc::{
     ErrorObject, HOST_UNKNOWN, INVALID_PARAMS, METHOD_NOT_FOUND, VERSION_UNSUPPORTED,
 };
 use crate::protocol::{
-    self, AgentEnd, AgentStart, DisplayDirective, HostBye, HostHello, PetBubble, PingParams,
-    ToolEnd, ToolStart,
+    self, AgentEnd, AgentSettled, AgentStart, DisplayDirective, HostBye, HostHello, PetBubble,
+    PingParams, ToolEnd, ToolStart,
 };
 
 /// 全部宿主注销后，daemon 继续存活多久（`docs/PROTOCOL.md` §8）。
@@ -93,6 +94,19 @@ pub struct Session {
     /// 退出是终态：主循环收到 `Exit` 后还要跑几拍才能真正结束进程，
     /// 没这个标志就会把「该退出了」反复上报、反复打日志。
     retired: bool,
+    /// 待发提醒。会话层只负责「攒」，发送是 `main` 的事。
+    ///
+    /// 提醒可能很慢（要起子进程判定人在不在、要出网推手机），
+    /// 所以绝不能在会话线程里直接发；而一次调用又可能同时要改显示又要提醒，
+    /// 用一条队列比往 [`Outcome`] 里塞一个变体清楚。
+    alerts: Vec<Request>,
+    /// 每个宿主最近一次 `agent/end` 的结局。
+    ///
+    /// `agent/settled` 按协议不带 `success`（`docs/PROTOCOL.md` §5）：
+    /// 宿主能观察到的只是「不会再自动继续」，逼它在这里重报一次结果
+    /// 等于逼它编个值。所以结局由 daemon 自己记，用来决定这一步
+    /// 到底该庆祝还是该给个失败的脸色。
+    last_end: HashMap<String, bool>,
 }
 
 impl Session {
@@ -108,7 +122,17 @@ impl Session {
             pet_id: setup.pet_id,
             last: None,
             retired: false,
+            alerts: Vec::new(),
+            last_end: HashMap::new(),
         })
+    }
+
+    /// 取走待发提醒。
+    ///
+    /// 用「取走」而不是「读一下」的语义：提醒是一次性的，
+    /// 重复发会比漏发更让人恼火。
+    pub fn take_alerts(&mut self) -> Vec<Request> {
+        std::mem::take(&mut self.alerts)
     }
 
     /// 该宠物包是否自带行为规则表。
@@ -148,18 +172,18 @@ impl Session {
         }
         let reaped = self.arbiter.reap_dead(now, HOST_TIMEOUT);
         for host in &reaped {
-            println!(
-                "litepet: 宿主 {host} 已 {}s 无消息，视为断开",
+            log::info!(
+                "宿主 {host} 已 {}s 无消息，视为断开",
                 HOST_TIMEOUT.as_secs()
             );
         }
         if !reaped.is_empty() {
-            println!("litepet: 当前宿主 {} 个", self.host_count());
+            log::info!("当前宿主 {} 个", self.host_count());
             self.begin_linger_if_empty(now);
         }
 
         if self.linger_expired(now) {
-            println!("litepet: 已无宿主连接满 {}s，退出", LINGER.as_secs());
+            log::info!("已无宿主连接满 {}s，退出", LINGER.as_secs());
             self.retired = true;
             return Outcome::Exit;
         }
@@ -197,28 +221,42 @@ impl Session {
             };
         }
 
-        let rules = match protocol::rule_event(method) {
-            Some(kind) if self.behavior.has_rules() => {
-                Some(self.behavior.resolve(&Event::new(kind, raw.clone())))
-            }
-            _ => None,
-        };
+        // 提醒要覆盖所有包，所以这里**不能**按 `has_rules()` 短路：
+        // 纯 Codex 包走 `resolve` 的降级分支，拿的是跨包通用的默认提醒。
+        // 早先按 `has_rules()` 短路，那些默认提醒就永远到不了提醒层。
+        let kind = protocol::rule_event(method);
+        let rules = kind.map(|kind| self.behavior.resolve(&Event::new(kind, raw.clone())));
 
-        match method {
+        let outcome = match method {
             protocol::method::HOST_HELLO => self.hello(parse_params(raw)?, now),
             protocol::method::HOST_BYE => self.bye(parse_params(raw)?, now),
             protocol::method::DAEMON_PING => self.ping(parse_params(raw)?),
-            protocol::method::AGENT_START => self.agent_start(parse_params(raw)?, rules, now),
-            protocol::method::AGENT_END => self.agent_end(parse_params(raw)?, rules, now),
-            protocol::method::TOOL_START => self.tool_start(parse_params(raw)?, rules, now),
-            protocol::method::TOOL_END => self.tool_end(parse_params(raw)?, rules, now),
-            protocol::method::PET_BUBBLE => self.bubble(parse_params(raw)?, rules, now),
+            protocol::method::AGENT_START => {
+                self.agent_start(parse_params(raw)?, rules.as_ref(), now)
+            }
+            protocol::method::AGENT_END => self.agent_end(parse_params(raw)?, rules.as_ref(), now),
+            protocol::method::AGENT_SETTLED => {
+                self.agent_settled(parse_params(raw)?, rules.as_ref(), now)
+            }
+            protocol::method::TOOL_START => {
+                self.tool_start(parse_params(raw)?, rules.as_ref(), now)
+            }
+            protocol::method::TOOL_END => self.tool_end(parse_params(raw)?, rules.as_ref(), now),
+            protocol::method::PET_BUBBLE => self.bubble(parse_params(raw)?, rules.as_ref(), now),
             protocol::method::DAEMON_INFO => self.info(),
             other => Err(ErrorObject::new(
                 METHOD_NOT_FOUND,
                 format!("未知方法：{other}"),
             )),
+        };
+        // 只有这次调用真的成功了才提醒：参数写错的 `agent/end`
+        // 不该把主人从桌子那头叫过来。
+        if outcome.is_ok() {
+            if let Some(kind) = kind {
+                self.queue_alert(kind, rules.as_ref());
+            }
         }
+        outcome
     }
 
     /// `host/hello`：登记宿主，并告知本机协议版本。
@@ -238,15 +276,18 @@ impl Session {
             .with_data(json!({ "supported": protocol::PROTOCOL_VERSION })));
         }
 
-        println!(
-            "litepet: 宿主 {} 已接入（pid {}{}{}）",
+        log::info!(
+            "宿主 {} 已接入（pid {}{}{}）",
             msg.host,
-            msg.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+            msg.pid
+                .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
             suffix("agent", msg.agent_version.as_deref()),
             suffix("client", msg.client_version.as_deref()),
         );
         self.arbiter.register(&msg.host, now);
-        println!("litepet: 当前宿主 {} 个", self.host_count());
+        // 重连也算新会话：上一轮遗留的「结局」不能拿来解释新一轮的 `agent/settled`。
+        self.last_end.remove(&msg.host);
+        log::info!("当前宿主 {} 个", self.host_count());
         self.empty_since = None;
         Ok(protocol::hello_result(
             env!("CARGO_PKG_VERSION"),
@@ -256,13 +297,13 @@ impl Session {
 
     /// `host/bye`：宿主正常退出。
     fn bye(&mut self, msg: HostBye, now: Instant) -> Result<Value, ErrorObject> {
-        println!(
-            "litepet: 宿主 {} 已断开{}",
+        log::info!(
+            "宿主 {} 已断开{}",
             msg.host,
             suffix("原因", msg.reason.as_deref()),
         );
         self.arbiter.unregister(&msg.host);
-        println!("litepet: 当前宿主 {} 个", self.host_count());
+        log::info!("当前宿主 {} 个", self.host_count());
         self.begin_linger_if_empty(now);
         Ok(Value::Null)
     }
@@ -276,20 +317,20 @@ impl Session {
     fn agent_start(
         &mut self,
         msg: AgentStart,
-        rules: Option<Resolution>,
+        rules: Option<&Resolution>,
         now: Instant,
     ) -> Result<Value, ErrorObject> {
-        println!(
-            "litepet: 宿主 {} 开始工作{}",
+        log::info!(
+            "宿主 {} 开始工作{}",
             msg.host,
             parens("session", msg.session_id.as_deref()),
         );
         if let Some(summary) = msg.summary.as_deref() {
-            println!("litepet: 宿主 {} 任务：{summary}", msg.host);
+            log::info!("宿主 {} 任务：{summary}", msg.host);
         }
         self.arbiter.on_agent_start(&msg.host, now);
         // 状态迁移类规则：显式 play 持续到下次状态变迁。
-        if let Some(play) = rules.and_then(|rules| rules.play) {
+        if let Some(play) = rules.and_then(|rules| rules.play.clone()) {
             self.arbiter.set_override(&msg.host, play, None);
         }
         Ok(Value::Null)
@@ -299,17 +340,38 @@ impl Session {
     fn agent_end(
         &mut self,
         msg: AgentEnd,
-        rules: Option<Resolution>,
+        rules: Option<&Resolution>,
         now: Instant,
     ) -> Result<Value, ErrorObject> {
-        println!(
-            "litepet: 宿主 {} 结束工作（{}）{}",
+        log::info!(
+            "宿主 {} 结束工作（{}）{}",
             msg.host,
             if msg.success { "成功" } else { "失败" },
             parens("session", msg.session_id.as_deref()),
         );
         self.arbiter.on_agent_end(&msg.host, msg.success, now);
-        if let Some(play) = rules.and_then(|rules| rules.play) {
+        self.last_end.insert(msg.host.clone(), msg.success);
+        if let Some(play) = rules.and_then(|rules| rules.play.clone()) {
+            self.arbiter.set_override(&msg.host, play, None);
+        }
+        Ok(Value::Null)
+    }
+
+    /// `agent/settled`：整轮结束且不会自动继续，进庆祝或失败反馈。
+    fn agent_settled(
+        &mut self,
+        msg: AgentSettled,
+        rules: Option<&Resolution>,
+        now: Instant,
+    ) -> Result<Value, ErrorObject> {
+        let last = self.last_end.get(&msg.host).copied();
+        log::info!(
+            "宿主 {} 已停稳，不会自动继续（{}）",
+            msg.host,
+            parens("session", msg.session_id.as_deref()),
+        );
+        self.arbiter.on_agent_settled(&msg.host, last, now);
+        if let Some(play) = rules.and_then(|rules| rules.play.clone()) {
             self.arbiter.set_override(&msg.host, play, None);
         }
         Ok(Value::Null)
@@ -319,10 +381,10 @@ impl Session {
     fn tool_start(
         &mut self,
         msg: ToolStart,
-        rules: Option<Resolution>,
+        rules: Option<&Resolution>,
         now: Instant,
     ) -> Result<Value, ErrorObject> {
-        self.transient_play(&msg.host, rules.as_ref(), now);
+        self.transient_play(&msg.host, rules, now);
         let bubble = rules.as_ref().and_then(|rules| rules.bubble.as_ref());
         self.arbiter.on_tool_start(
             &msg.host,
@@ -338,10 +400,10 @@ impl Session {
     fn tool_end(
         &mut self,
         msg: ToolEnd,
-        rules: Option<Resolution>,
+        rules: Option<&Resolution>,
         now: Instant,
     ) -> Result<Value, ErrorObject> {
-        self.transient_play(&msg.host, rules.as_ref(), now);
+        self.transient_play(&msg.host, rules, now);
         let bubble = rules.as_ref().and_then(|rules| rules.bubble.as_ref());
         self.arbiter.on_tool_end(
             &msg.host,
@@ -357,16 +419,17 @@ impl Session {
     fn bubble(
         &mut self,
         msg: PetBubble,
-        rules: Option<Resolution>,
+        rules: Option<&Resolution>,
         now: Instant,
     ) -> Result<Value, ErrorObject> {
-        self.transient_play(&msg.host, rules.as_ref(), now);
+        self.transient_play(&msg.host, rules, now);
         if msg.kind == protocol::BubbleKind::Unknown {
             // 降级显示而不是拒绝（协议前向兼容），但必须留痕：
             // 适配器作者在对面看不到任何报错，这条日志是唯一的排错线索。
-            println!(
-                "litepet: 宿主 {} 发来未知气泡类别，按最低优先级显示：{}",
-                msg.host, msg.text
+            log::info!(
+                "宿主 {} 发来未知气泡类别，按最低优先级显示：{}",
+                msg.host,
+                msg.text
             );
         }
         self.arbiter
@@ -393,6 +456,23 @@ impl Session {
             let expires_at = now + Duration::from_millis(FEEDBACK_MS);
             self.arbiter.set_override(host, play, Some(expires_at));
         }
+    }
+
+    /// 把规则求值出的提醒排入队列。
+    ///
+    /// 提醒在这里统一排队，而不是在五个 `agent_*`/`tool_*` 分支里各写一遍：
+    /// 要不要提醒只取决于规则表怎么说，与事件本身怎么处理无关。
+    fn queue_alert(&mut self, kind: &str, rules: Option<&Resolution>) {
+        let Some(spec) = rules.and_then(|rules| rules.alert.clone()) else {
+            return;
+        };
+        // 空壳规格（既不响也不弹不推）直接剔掉，不把噪声带给提醒层。
+        if spec.is_inert() {
+            return;
+        }
+        let body = alert_body(kind, rules);
+        log::info!("规则命中提醒：{kind}（{body}）");
+        self.alerts.push(Request::new(spec, ALERT_TITLE, body));
     }
 
     /// 重算指令，只在真正变化时推送。
@@ -422,12 +502,47 @@ impl Session {
     }
 }
 
+/// 系统通知的标题。
+///
+/// 宠物包不提供标题，所以用一个固定名。它不需要区分是谁发的：
+/// 通知中心里能认出来源就够了，而包里多一个标题字段只是多一个会写错的地方。
+const ALERT_TITLE: &str = "LitePet";
+
+/// 把规则求值出的提醒排入队列。
+///
+/// 正文优先用气泡文字：规则作者写的那句话本来就是给人看的，
+/// 而通知里空着正文比给一句废话更糟。
+fn alert_body(kind: &str, rules: Option<&Resolution>) -> String {
+    rules
+        .and_then(|rules| rules.bubble.as_ref())
+        .map(|bubble| bubble.text.clone())
+        .unwrap_or_else(|| describe_event(kind).to_string())
+}
+
+/// 事件名 → 一句人话，用于没有气泡可借的提醒。
+///
+/// 名字与 [`crate::protocol::rule_event`] 给出的规则事件名一一对应。
+fn describe_event(kind: &str) -> &'static str {
+    match kind {
+        "agent.settled" => "这一轮干完了",
+        "agent.start" => "开始干活了",
+        "agent.end" => "一轮结束",
+        "tool.start" => "开始执行工具",
+        "tool.end" => "工具执行完毕",
+        "bubble" => "有新消息",
+        // 新增了规则事件却忘了在这里补一句时的兜底，
+        // 宁可发一条没信息量的通知，也不要静默地什么都不发。
+        _ => "有新的进展",
+    }
+}
+
 /// 这些方法只对「已经打过招呼的宿主」有意义。
 fn needs_session(method: &str) -> bool {
     matches!(
         method,
         protocol::method::AGENT_START
             | protocol::method::AGENT_END
+            | protocol::method::AGENT_SETTLED
             | protocol::method::TOOL_START
             | protocol::method::TOOL_END
             | protocol::method::PET_BUBBLE
@@ -541,14 +656,117 @@ mod tests {
         assert!(!matches!(outcome, Outcome::Exit), "不应退出");
     }
 
+    /// 纯 Codex 包的会话（没有 `litepet` 键）。
+    ///
+    /// 它和带规则表的包有一个关键差异：反馈动画走 §4.4 的**逐状态**降级映射
+    /// （`Success`→`bounce`、`Failure`→`sad`、`Celebrate`→`wave`），
+    /// 而不是四个状态共用 `feedback` 组轮换。所以「庆祝还是失败」
+    /// 在这类包上真的看得见，也才是验证 `agent/settled` 取哪个状态的唯一载体。
+    fn codex_session() -> Session {
+        let known = [
+            "idle", "running", "waiting", "bounce", "jumping", "sad", "failed", "wave", "waving",
+        ]
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+        Session::new(Setup {
+            pet_id: "xunjian-miao".to_string(),
+            known,
+            litepet: None,
+            resident: false,
+        })
+        .expect("应能构造会话")
+    }
+
+    /// 取一次调用产生的动画名。
+    fn animation(outcome: Outcome) -> Option<String> {
+        match outcome {
+            Outcome::Display(directive) => Some(directive.animation),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn settled_without_a_prior_end_celebrates() {
+        let now = Instant::now();
+        let mut session = codex_session();
+        send(&mut session, protocol::method::HOST_HELLO, hello("pi"), now);
+        let outcome = send(
+            &mut session,
+            protocol::method::AGENT_SETTLED,
+            json!({ "host": "pi" }),
+            now,
+        );
+
+        // 没记到结局就按「完成」处理：`agent/settled` 本身就说明不用再等了。
+        assert_eq!(animation(outcome).as_deref(), Some("wave"));
+    }
+
+    #[test]
+    fn settled_after_a_failed_end_keeps_the_failure_face() {
+        let now = Instant::now();
+        let mut session = codex_session();
+        send(&mut session, protocol::method::HOST_HELLO, hello("pi"), now);
+        send(
+            &mut session,
+            protocol::method::AGENT_END,
+            json!({ "host": "pi", "success": false }),
+            now,
+        );
+        let outcome = send(
+            &mut session,
+            protocol::method::AGENT_SETTLED,
+            json!({ "host": "pi" }),
+            now,
+        );
+
+        // 关键：这里**不能**变。若把 `agent/settled` 一律当庆祝，
+        // 刚失败的宠物会突然眉开眼笑；指令相同所以会话层去重，
+        // 于是「没变」本身就是正确的观察结果。
+        assert!(
+            matches!(outcome, Outcome::Unchanged),
+            "失败之后停稳应继续给失败脸色，而不是跳去庆祝"
+        );
+        assert_eq!(current(&mut session, now).animation, "sad");
+    }
+
+    #[test]
+    fn reconnect_forgets_the_previous_outcome() {
+        let now = Instant::now();
+        let mut session = codex_session();
+        send(&mut session, protocol::method::HOST_HELLO, hello("pi"), now);
+        send(
+            &mut session,
+            protocol::method::AGENT_END,
+            json!({ "host": "pi", "success": false }),
+            now,
+        );
+        // 重连算新会话：上一轮遗留的失败结局不能拿来解释新一轮的停稳。
+        send(&mut session, protocol::method::HOST_HELLO, hello("pi"), now);
+        let outcome = send(
+            &mut session,
+            protocol::method::AGENT_SETTLED,
+            json!({ "host": "pi" }),
+            now,
+        );
+
+        assert_eq!(animation(outcome).as_deref(), Some("wave"));
+    }
+
     #[test]
     fn hello_produces_first_directive() {
         let now = Instant::now();
         let mut session = session();
         let answered = call(&mut session, protocol::method::HOST_HELLO, hello("pi"), now)
             .expect("host/hello 应成功");
-        assert!(matches!(answered.outcome, Outcome::Display(_)), "首帧应产生指令");
-        assert_eq!(answered.result["protocolVersion"], protocol::PROTOCOL_VERSION);
+        assert!(
+            matches!(answered.outcome, Outcome::Display(_)),
+            "首帧应产生指令"
+        );
+        assert_eq!(
+            answered.result["protocolVersion"],
+            protocol::PROTOCOL_VERSION
+        );
         assert_eq!(answered.result["petId"], "xunjian-miao");
         assert_eq!(session.host_count(), 1);
         assert_eq!(current(&mut session, now).animation, "idle");
@@ -619,8 +837,8 @@ mod tests {
         let mut session = session();
         send(&mut session, protocol::method::HOST_HELLO, hello("pi"), now);
         let bad = json!({ "host": "pi", "kind": "celebrate", "text": "交卷" });
-        let answered = call(&mut session, protocol::method::PET_BUBBLE, bad, now)
-            .expect("未知 kind 不应被拒");
+        let answered =
+            call(&mut session, protocol::method::PET_BUBBLE, bad, now).expect("未知 kind 不应被拒");
         let Outcome::Display(directive) = answered.outcome else {
             panic!("应推一条显示指令");
         };
@@ -641,7 +859,12 @@ mod tests {
         let mut session = session();
         send(&mut session, protocol::method::HOST_HELLO, hello("pi"), now);
 
-        send(&mut session, protocol::method::AGENT_START, json!({ "host": "pi" }), now);
+        send(
+            &mut session,
+            protocol::method::AGENT_START,
+            json!({ "host": "pi" }),
+            now,
+        );
         assert_eq!(current(&mut session, now).animation, "working");
 
         let end = now + Duration::from_millis(50);
@@ -750,7 +973,10 @@ mod tests {
             now,
         )
         .expect("已登记宿主的 ping 应成功");
-        assert_eq!(answered.result["protocolVersion"], protocol::PROTOCOL_VERSION);
+        assert_eq!(
+            answered.result["protocolVersion"],
+            protocol::PROTOCOL_VERSION
+        );
         assert_eq!(answered.result["ts"], 42);
     }
 
@@ -916,7 +1142,10 @@ mod tests {
         let answered = call(&mut session, protocol::method::DAEMON_INFO, json!({}), now)
             .expect("daemon/info 应成功");
         assert_eq!(answered.result["petId"], "xunjian-miao");
-        assert_eq!(answered.result["protocolVersion"], protocol::PROTOCOL_VERSION);
+        assert_eq!(
+            answered.result["protocolVersion"],
+            protocol::PROTOCOL_VERSION
+        );
         assert_eq!(answered.result["hostCount"], 1);
         assert_eq!(answered.result["resident"], false);
     }

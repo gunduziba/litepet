@@ -134,7 +134,9 @@ fn inferred_grid(atlas: AtlasSize) -> Result<GridSpec> {
     if !atlas.is_valid() {
         bail!("图集尺寸无效：{}x{}", atlas.width, atlas.height);
     }
-    if atlas.width % DEFAULT_FRAME_WIDTH != 0 || atlas.height % DEFAULT_FRAME_HEIGHT != 0 {
+    if !atlas.width.is_multiple_of(DEFAULT_FRAME_WIDTH)
+        || !atlas.height.is_multiple_of(DEFAULT_FRAME_HEIGHT)
+    {
         bail!(
             "图集 {}x{} 无法按缺省单格 {}x{} 整除，且 pet.json 未声明 frame",
             atlas.width,

@@ -89,6 +89,11 @@ pub struct LoadedPet {
     pub info: PetInfo,
     /// `litepet` 扩展键的原始 JSON（`docs/PET-PACK.md` §4.2），由行为模块解析。
     pub behavior: Option<serde_json::Value>,
+    /// 包自己的目录 `pets/<id>/`。
+    ///
+    /// 提醒层要拿它解析 `alert.sound` 里的相对路径（`docs/PET-PACK.md` §4.5）：
+    /// 包里自带音效是跨平台听感一致的唯一办法。
+    pub root: PathBuf,
 }
 
 /// 从 `pets/<id>/` 加载一个包。
@@ -106,7 +111,7 @@ pub fn load(pets_root: &Path, id: &str) -> Result<LoadedPet> {
     let atlas = image::read_size(&sheet)?;
     let frame = manifest::resolve_grid(&file, atlas)?;
     for warning in manifest::grid_warnings(&file, frame) {
-        eprintln!("litepet: 包 {id} 告警：{warning}");
+        log::warn!("包 {id} 告警：{warning}");
     }
     let animations = animations::build(frame, &file.animations)?;
 
@@ -120,6 +125,7 @@ pub fn load(pets_root: &Path, id: &str) -> Result<LoadedPet> {
             animations,
         },
         behavior: file.litepet.clone(),
+        root: dir,
     })
 }
 

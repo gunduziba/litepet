@@ -2,7 +2,7 @@
 //!
 //! 家目录约定见 `docs/PET-PACK.md` §2：`~/.litepet/` 同时装配置与 `pets/`。
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::fs;
@@ -18,6 +18,8 @@ const DEFAULT_HOME_DIR: &str = ".litepet";
 const CONFIG_FILE: &str = "config.json";
 /// 宠物包子目录名。
 const PETS_DIR: &str = "pets";
+/// 日志子目录名。
+const LOGS_DIR: &str = "logs";
 /// 运行期对接信息文件名。
 ///
 /// 与 `config.json`／`pets/` 同处家目录，受 `LITEPET_HOME` 控制。
@@ -31,6 +33,10 @@ const TOKEN_BYTES: usize = 16;
 const PRIVATE_MODE: u32 = 0o600;
 /// 默认窗口边长（像素）。
 const DEFAULT_SIZE: u32 = 220;
+/// 默认音量。
+const DEFAULT_SOUND_VOLUME: f32 = 0.35;
+/// 默认推送服务。
+const DEFAULT_PUSH_PROVIDER: &str = "bark";
 
 /// daemon 配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +60,9 @@ pub struct Config {
     /// 监听端口；改这里的同时要把宿主也改成同一个值。
     #[serde(default = "default_port")]
     pub port: u16,
+    /// 通知（声音／系统通知／手机推送）。
+    #[serde(default)]
+    pub notify: NotifyConfig,
 }
 
 impl Default for Config {
@@ -65,6 +74,7 @@ impl Default for Config {
             size: DEFAULT_SIZE,
             always_on_top: true,
             port: DEFAULT_PORT,
+            notify: NotifyConfig::default(),
         }
     }
 }
@@ -84,6 +94,93 @@ fn default_true() -> bool {
     true
 }
 
+/// 通知配置：`config.json` 的 `notify` 段（全部字段可缺省）。
+///
+/// **只放全局开关、凭据与阈值**：哪个事件该响哪一声、该不该推手机，
+/// 由宠物包的 `litepet.behavior` 规则表决定（见 `docs/PET-PACK.md` §4.2）。
+/// 两边各管一份映射只会互相矛盾，所以这里故意不提供逐事件覆盖。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NotifyConfig {
+    /// 总开关；关掉后声音、系统通知、推送都不发。
+    pub enabled: bool,
+    /// 声音通道。
+    pub sound: SoundConfig,
+    /// 系统通知通道。
+    pub desktop: DesktopConfig,
+    /// 手机推送通道。
+    pub push: PushConfig,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sound: SoundConfig::default(),
+            desktop: DesktopConfig::default(),
+            push: PushConfig::default(),
+        }
+    }
+}
+
+/// 声音通道配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SoundConfig {
+    /// 声音开关。
+    pub enabled: bool,
+    /// 音量，`0.0..=1.0`；超出范围会被夹到边界。
+    pub volume: f32,
+}
+
+impl Default for SoundConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            volume: DEFAULT_SOUND_VOLUME,
+        }
+    }
+}
+
+/// 系统通知通道配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DesktopConfig {
+    /// 系统通知开关。
+    pub enabled: bool,
+}
+
+impl Default for DesktopConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// 手机推送通道配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PushConfig {
+    /// 推送开关。
+    pub enabled: bool,
+    /// 推送服务标识；目前提供 `bark`。
+    pub provider: String,
+    /// 设备密钥。按约定以**明文**存在配置里，因此 `config.json` 以 `0600` 写入。
+    pub device_key: String,
+    /// 自定义推送端点；`None` 用 provider 的默认端点。
+    pub endpoint: Option<String>,
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: DEFAULT_PUSH_PROVIDER.to_string(),
+            device_key: String::new(),
+            endpoint: None,
+        }
+    }
+}
+
 /// 家目录，受 `LITEPET_HOME` 覆盖；否则为 `~/.litepet`。
 pub fn home_dir() -> Result<PathBuf> {
     if let Some(raw) = std::env::var_os(HOME_ENV) {
@@ -96,6 +193,11 @@ pub fn home_dir() -> Result<PathBuf> {
 /// 宠物包根目录 `~/.litepet/pets`。
 pub fn pets_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join(PETS_DIR))
+}
+
+/// 日志目录 `~/.litepet/logs`。
+pub fn logs_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join(LOGS_DIR))
 }
 
 /// 配置文件路径 `~/.litepet/config.json`。
@@ -211,15 +313,12 @@ pub fn load_or_init() -> Result<(Config, bool)> {
 }
 
 /// 写回配置。
+///
+/// 走私有写入：配置里有明文推送密钥，不能让同机其他用户读到。
 pub fn save(cfg: &Config) -> Result<()> {
     let path = config_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("创建家目录失败：{}", parent.display()))?;
-    }
     let body = serde_json::to_string_pretty(cfg).context("序列化配置失败")?;
-    fs::write(&path, body).with_context(|| format!("写入配置失败：{}", path.display()))?;
-    Ok(())
+    write_private(&path, &body)
 }
 
 #[cfg(test)]
@@ -232,10 +331,74 @@ mod tests {
         let home = home_dir().expect("应能定位家目录");
         assert_eq!(pets_dir().expect("pets"), home.join("pets"));
         assert_eq!(config_path().expect("config"), home.join("config.json"));
+        assert_eq!(endpoint_path().expect("endpoint"), home.join("daemon.json"));
+        assert_eq!(logs_dir().expect("logs"), home.join("logs"));
+    }
+
+    /// 旧的配置文件里没有 `notify` 段，读出来必须是一份可用的默认值。
+    #[test]
+    fn notify_section_defaults_when_absent() {
+        let legacy = r#"{"pet":"xunjian-miao"}"#;
+        let cfg: Config = serde_json::from_str(legacy).expect("应能读取旧配置");
+        assert!(cfg.notify.enabled, "通知默认开着");
+        assert!(cfg.notify.sound.enabled);
+        assert_eq!(cfg.notify.sound.volume, DEFAULT_SOUND_VOLUME);
+        assert!(cfg.notify.desktop.enabled);
+        assert!(!cfg.notify.push.enabled, "推送要用户自己开");
+        assert_eq!(cfg.notify.push.provider, DEFAULT_PUSH_PROVIDER);
+    }
+
+    /// 只写了一部分字段的 `notify` 段，其余字段补齐而不是整段报错。
+    #[test]
+    fn notify_section_fills_partial_input() {
+        let partial = r#"{"notify":{"push":{"enabled":true,"deviceKey":"abc"}}}"#;
+        let cfg: Config = serde_json::from_str(partial).expect("应能解析部分配置");
+        assert!(cfg.notify.push.enabled);
+        assert_eq!(cfg.notify.push.device_key, "abc");
+        assert!(cfg.notify.sound.enabled, "未提到的通道保持默认");
+    }
+
+    /// 落盘后的 `notify` 段字段名是外部契约（`docs/PET-PACK.md` §4.5.2 的样例
+    /// 与用户手写的配置都靠它），所以用 camelCase 锁住，不能被结构体重命名悄悄改掉。
+    #[test]
+    fn notify_section_serializes_camel_case() {
+        let json = serde_json::to_value(Config::default()).expect("应能序列化");
+        let notify = &json["notify"];
+        assert_eq!(notify["enabled"], serde_json::json!(true));
+        assert_eq!(notify["sound"]["enabled"], serde_json::json!(true));
         assert_eq!(
-            endpoint_path().expect("endpoint"),
-            home.join("daemon.json")
+            notify["sound"]["volume"],
+            serde_json::json!(DEFAULT_SOUND_VOLUME)
         );
+        assert_eq!(notify["desktop"]["enabled"], serde_json::json!(true));
+        assert_eq!(notify["push"]["enabled"], serde_json::json!(false));
+        assert_eq!(
+            notify["push"]["provider"],
+            serde_json::json!(DEFAULT_PUSH_PROVIDER)
+        );
+        assert_eq!(notify["push"]["deviceKey"], serde_json::json!(""));
+        assert!(notify["push"]["endpoint"].is_null());
+
+        // 旧的「人在不在」判定参数已整体移除。字段一旦回流，这里会先报错，
+        // 而不是等用户发现自己的开关被默默忽略。
+        assert!(notify.get("presence").is_none());
+        assert!(notify["desktop"].get("whenFocused").is_none());
+        assert!(notify["push"].get("onlyWhenAway").is_none());
+    }
+
+    /// 配置里有明文推送密钥，所以必须 0600 落盘。
+    #[test]
+    fn config_file_is_owner_only() {
+        let dir = std::env::temp_dir().join(format!("litepet-cfg-mode-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("应能建临时目录");
+        let path = dir.join("config.json");
+        write_private(&path, "{}").expect("应能写入");
+        let mode = fs::metadata(&path)
+            .expect("应能读元数据")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, PRIVATE_MODE, "实际权限 {:o}", mode & 0o777);
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -255,7 +418,10 @@ mod tests {
             token: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
         };
         let body = serde_json::to_string(&endpoint).expect("应能序列化");
-        assert!(body.contains("\"protocolVersion\""), "字段名用 camelCase：{body}");
+        assert!(
+            body.contains("\"protocolVersion\""),
+            "字段名用 camelCase：{body}"
+        );
         assert_eq!(
             serde_json::from_str::<Endpoint>(&body).expect("应能反序列化"),
             endpoint
@@ -277,13 +443,19 @@ mod tests {
         let path = dir.join("daemon.json");
 
         write_private(&path, "{}").expect("应能写入");
-        let mode = fs::metadata(&path).expect("应能读元数据").permissions().mode();
+        let mode = fs::metadata(&path)
+            .expect("应能读元数据")
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, PRIVATE_MODE, "实际权限 {:o}", mode & 0o777);
 
         // 已存在但权限过宽的文件也要被收窄。
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("应能改权限");
         write_private(&path, "{}").expect("应能重写");
-        let mode = fs::metadata(&path).expect("应能读元数据").permissions().mode();
+        let mode = fs::metadata(&path)
+            .expect("应能读元数据")
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, PRIVATE_MODE, "重写后应收窄权限");
 
         fs::remove_dir_all(&dir).ok();

@@ -15,6 +15,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::alert::AlertSpec;
 use crate::protocol::BubbleKind;
 
 /// `behavior.idleTimeoutMs` 缺省值（`docs/PET-PACK.md` §4.2）。
@@ -80,6 +81,47 @@ const CODEX_FALLBACK: &[(&str, &[&str])] = &[
     ("feedback.celebrate", &["wave", "waving"]),
 ];
 
+/// 纯 Codex 包的默认规格：出声 + 系统通知 + 允许推手机。
+///
+/// 「是否真的推」不在这里定：那要看人到底在不在电脑前，是 [`crate::alert::plan`] 的事。
+fn fallback_spec(sound: &str) -> AlertSpec {
+    AlertSpec {
+        sound: Some(sound.to_string()),
+        desktop: true,
+        push: true,
+    }
+}
+
+/// 纯 Codex 包（没有 `litepet.behavior` 规则表）的默认提醒。
+///
+/// 规则表本就是可选的，但「整轮干完了」这类语义是跳包通用的。少了这几条，
+/// 提醒链路对纯 Codex 包就是死的——用户会以为功能坏了，而不是以为“这个包没声”。
+///
+/// 音效名字用了 macOS 的系统音效名；其他平台按名字回退，见 [`crate::alert::sound`]。
+fn fallback_alert(event: &Event<'_>) -> Option<AlertSpec> {
+    match event.kind {
+        // 整轮结束且不会自动继续：用户最需要被告知的一件事。
+        event_names::AGENT_SETTLED => Some(fallback_spec("Glass")),
+        // 一轮以失败告终。成功不提醒：屏幕上本来就在动，再响会很快变噪声。
+        event_names::AGENT_END
+            if event.fields.get("success").and_then(Value::as_bool) == Some(false) =>
+        {
+            Some(fallback_spec("Basso"))
+        }
+        _ => None,
+    }
+}
+
+/// 事件名常量：直接用字符串字面量容易静静嗄死去，这里集中一处。
+///
+/// 值与 [`crate::protocol::rule_event`] 给出的规则事件名一致。
+mod event_names {
+    /// `agent/settled` → `agent.settled`。
+    pub const AGENT_SETTLED: &str = "agent.settled";
+    /// `agent/end` → `agent.end`。
+    pub const AGENT_END: &str = "agent.end";
+}
+
 /// 规则表给出的播放目标。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Play {
@@ -118,6 +160,9 @@ struct Rule {
     /// 气泡；省略表示不出气泡。
     #[serde(default)]
     bubble: Option<BubbleSpec>,
+    /// 提醒（声音/系统通知/手机推送）；省略表示这组规则不提醒。
+    #[serde(default)]
+    alert: Option<AlertSpec>,
 }
 
 /// 一条事件的规则求值结果。
@@ -127,6 +172,8 @@ pub struct Resolution {
     pub play: Option<Play>,
     /// 要出的气泡。
     pub bubble: Option<BubbleSpec>,
+    /// 要发的提醒；`None` 表示这条规则不提醒。
+    pub alert: Option<AlertSpec>,
 }
 
 /// 一次可被规则匹配的事件。
@@ -217,7 +264,9 @@ impl Behavior {
     /// 无事件多久进入 `resting`。
     pub fn idle_timeout(&self) -> Duration {
         match &self.mode {
-            Mode::Rules { idle_timeout_ms, .. } => Duration::from_millis(*idle_timeout_ms),
+            Mode::Rules {
+                idle_timeout_ms, ..
+            } => Duration::from_millis(*idle_timeout_ms),
             Mode::CodexFallback => Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS),
         }
     }
@@ -236,9 +285,15 @@ impl Behavior {
     }
 
     /// 按规则表求值一次事件（`docs/PET-PACK.md` §4.3：首个匹配生效）。
+    ///
+    /// 纯 Codex 包没有规则表，动画、气泡都不管，但仍会给出跨包通用的默认提醒。
     pub fn resolve(&self, event: &Event<'_>) -> Resolution {
         let Mode::Rules { rules, .. } = &self.mode else {
-            return Resolution::default();
+            return Resolution {
+                play: None,
+                bubble: None,
+                alert: fallback_alert(event),
+            };
         };
         rules
             .iter()
@@ -249,6 +304,7 @@ impl Behavior {
                     kind: spec.kind,
                     text: interpolate(&spec.text, &event.fields),
                 }),
+                alert: rule.alert.clone(),
             })
             .unwrap_or_default()
     }
@@ -277,7 +333,10 @@ impl Behavior {
 }
 
 /// 解析 `behavior.groups`，并校验每个动画都存在。
-fn parse_groups(raw: Option<&Value>, known: &BTreeSet<String>) -> Result<BTreeMap<String, Vec<String>>> {
+fn parse_groups(
+    raw: Option<&Value>,
+    known: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Vec<String>>> {
     let Some(raw) = raw else {
         return Ok(BTreeMap::new());
     };
@@ -317,6 +376,17 @@ fn parse_rules(
             // 降级显示、看起来却像没问题的规则（docs/PET-PACK.md §0.1）。
             if bubble.kind == BubbleKind::Unknown {
                 bail!("规则 {on} 的 bubble.kind 不是已知类别", on = rule.on);
+            }
+        }
+        if let Some(alert) = rule.alert.as_ref() {
+            alert.validate(&format!("规则 {} 的", rule.on))?;
+            // 三个通道全关的 `alert` 等于什么都没写。不报错的话它会静静消失，
+            // 而作者以为自己在「暂时关掉提醒」，实际是埋了个永远不响的坑。
+            if alert.is_inert() {
+                bail!(
+                    "规则 {on} 的 alert 三个通道全部关闭，等于没写；请删掉 alert 键",
+                    on = rule.on
+                );
             }
         }
         let Some(target) = rule.play.as_deref() else {
@@ -360,11 +430,13 @@ fn rule_matches(rule: &Rule, event: &Event<'_>) -> bool {
     let Some(expected) = when.as_object() else {
         return false;
     };
-    expected.iter().all(|(key, want)| match event.fields.get(key) {
-        Some(actual) if want.is_null() => !actual.is_null(),
-        Some(actual) => actual == want,
-        None => false,
-    })
+    expected
+        .iter()
+        .all(|(key, want)| match event.fields.get(key) {
+            Some(actual) if want.is_null() => !actual.is_null(),
+            Some(actual) => actual == want,
+            None => false,
+        })
 }
 
 /// `{字段名}` 插值；未知字段原样保留，便于发现拼写错误。
@@ -410,10 +482,22 @@ mod tests {
 
     /// 一套够用的动画名集合，覆盖 Codex 默认表里的相关项。
     fn known() -> BTreeSet<String> {
-        ["idle", "working", "rest_tea", "rest_sleep", "celebrate", "sad", "running", "waiting", "bounce", "jumping", "wave"]
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect()
+        [
+            "idle",
+            "working",
+            "rest_tea",
+            "rest_sleep",
+            "celebrate",
+            "sad",
+            "running",
+            "waiting",
+            "bounce",
+            "jumping",
+            "wave",
+        ]
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
     }
 
     /// 把一段 `behavior` 配置包成完整的 `litepet` 扩展对象。
@@ -448,7 +532,10 @@ mod tests {
     fn absent_extension_uses_codex_fallback() {
         let behavior = Behavior::new(None, &known()).expect("应降级成功");
         assert!(!behavior.has_rules());
-        assert_eq!(behavior.idle_timeout(), Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS));
+        assert_eq!(
+            behavior.idle_timeout(),
+            Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS)
+        );
         let known = known();
         assert_eq!(
             behavior.play_for(Stage::Working, &known),
@@ -467,7 +554,10 @@ mod tests {
     #[test]
     fn codex_fallback_skips_missing_candidates() {
         // 只有 jumping，没有 bounce，应退到 jumping。
-        let known: BTreeSet<String> = ["idle", "jumping"].iter().map(|s| (*s).to_string()).collect();
+        let known: BTreeSet<String> = ["idle", "jumping"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         let behavior = Behavior::new(None, &known).expect("应降级成功");
         assert_eq!(
             behavior.play_for(Stage::Success, &known),
@@ -498,7 +588,10 @@ mod tests {
         let behavior = rules_behavior();
         let success = Event::new("agent.end", json!({ "success": true }));
         let resolution = behavior.resolve(&success);
-        assert_eq!(resolution.play, Some(Play::Animation("celebrate".to_string())));
+        assert_eq!(
+            resolution.play,
+            Some(Play::Animation("celebrate".to_string()))
+        );
         assert_eq!(resolution.bubble.expect("应出气泡").text, "任务完成");
 
         let failure = Event::new("agent.end", json!({ "success": false }));
@@ -606,7 +699,9 @@ mod tests {
         });
         let behavior = Behavior::new(Some(&litepet(behavior)), &known()).expect("应能解析");
         assert_eq!(
-            behavior.resolve(&Event::new("tool.end", json!({ "isError": true }))).play,
+            behavior
+                .resolve(&Event::new("tool.end", json!({ "isError": true })))
+                .play,
             Some(Play::Animation("sad".to_string()))
         );
         // 字段缺失 → 不匹配。

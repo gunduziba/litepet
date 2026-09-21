@@ -18,10 +18,11 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde_json::Value;
 use tiny_http::{Header, Method, Request, Response as HttpResponse, Server, StatusCode};
 
+use crate::alert::Request as AlertRequest;
 use crate::jsonrpc::{self, ErrorObject, Response as JsonResponse};
 use crate::protocol::DisplayDirective;
 use crate::session::{Outcome, Session};
@@ -45,6 +46,12 @@ pub struct Hooks {
     pub display: Box<dyn Fn(DisplayDirective) + Send + Sync>,
     /// 会话要求退出进程。
     pub exit: Box<dyn Fn() + Send + Sync>,
+    /// 会话排出了一条待发提醒。
+    ///
+    /// 回调必须**立刻返回**：它跑在 HTTP 工作线程上，而发提醒本身可能很慢
+    /// （判定人在不在要起子进程、推手机要出网）。
+    /// 真正的实现（`main`）只负责把活丢给后台线程。
+    pub alert: Box<dyn Fn(AlertRequest) + Send + Sync>,
 }
 
 /// 监听回环地址上的 `port`。
@@ -78,7 +85,7 @@ pub fn serve(server: Server, sessions: Arc<Mutex<Session>>, token: String, hooks
                 // 超时是正常的：空转交给 ticker 线程，这里只是回来看看有没有新请求。
                 Ok(None) => {}
                 Err(err) => {
-                    eprintln!("litepet: 接收请求失败，该工作线程退出：{err}");
+                    log::error!("接收请求失败，该工作线程退出：{err}");
                     return;
                 }
             }
@@ -96,7 +103,7 @@ fn spawn_ticker(sessions: Arc<Mutex<Session>>, hooks: Arc<Hooks>) {
         let deadline = match sessions.lock() {
             Ok(session) => session.next_deadline(Instant::now()),
             Err(_) => {
-                eprintln!("litepet: 会话状态已损坏，空转线程退出");
+                log::error!("会话状态已损坏，空转线程退出");
                 return;
             }
         };
@@ -115,12 +122,7 @@ fn spawn_ticker(sessions: Arc<Mutex<Session>>, hooks: Arc<Hooks>) {
 }
 
 /// 处理一个 HTTP 请求。参数按值传入，因为 `respond` 会消费请求。
-fn handle(
-    mut request: Request,
-    sessions: &Arc<Mutex<Session>>,
-    token: &str,
-    hooks: &Arc<Hooks>,
-) {
+fn handle(mut request: Request, sessions: &Arc<Mutex<Session>>, token: &str, hooks: &Arc<Hooks>) {
     if request.url() != RPC_PATH {
         respond_text(request, 404, &format!("仅支持 POST {RPC_PATH}"));
         return;
@@ -151,11 +153,7 @@ fn handle(
 ///
 /// 返回 `None` 表示这是通知，不该有任何响应体。
 /// 与 HTTP 无关，因此可以脱离网络单测。
-fn dispatch(
-    body: &str,
-    sessions: &Arc<Mutex<Session>>,
-    hooks: &Arc<Hooks>,
-) -> Option<String> {
+fn dispatch(body: &str, sessions: &Arc<Mutex<Session>>, hooks: &Arc<Hooks>) -> Option<String> {
     let request = match jsonrpc::parse(body) {
         Ok(request) => request,
         // 连 id 都还没读到（JSON-RPC 2.0 §5：此时 id 必须是 null）。
@@ -164,14 +162,26 @@ fn dispatch(
 
     let notification = request.is_notification();
     let id = request.response_id();
-    let answered = match sessions.lock() {
-        Ok(mut session) => session.call(&request.method, request.params.as_ref(), Instant::now()),
-        Err(_) => Err(ErrorObject::new(jsonrpc::INTERNAL_ERROR, "会话状态已损坏")),
+    let (answered, alerts) = match sessions.lock() {
+        Ok(mut session) => {
+            let answered = session.call(&request.method, request.params.as_ref(), Instant::now());
+            // 提醒必须在同一个锁里取走：放到锁外再取的话，
+            // 并发的一次调用会把别人的提醒捎带出去，或者把自己的吃掉。
+            (answered, session.take_alerts())
+        }
+        Err(_) => (
+            Err(ErrorObject::new(jsonrpc::INTERNAL_ERROR, "会话状态已损坏")),
+            Vec::new(),
+        ),
     };
 
     match answered {
         Ok(answered) => {
             publish(answered.outcome, hooks);
+            // 提醒排在回复之后：通知渠道再慢也不该拖慢宿主拿到的响应。
+            for alert in alerts {
+                (hooks.alert)(alert);
+            }
             if notification {
                 None
             } else {
@@ -181,7 +191,7 @@ fn dispatch(
         Err(error) => {
             if notification {
                 // 通知没有回复通道，只能记日志（JSON-RPC 2.0 §4.1）。
-                eprintln!("litepet: 通知 {} 被拒：{}", request.method, error.message);
+                log::warn!("通知 {} 被拒：{}", request.method, error.message);
                 None
             } else {
                 Some(JsonResponse::failure(id, error).to_body())
@@ -257,7 +267,7 @@ fn respond_json(request: Request, body: &str) {
 /// 统一收尾：回响应并记录失败。
 fn finish<R: Read>(request: Request, response: HttpResponse<R>) {
     if let Err(err) = request.respond(response) {
-        eprintln!("litepet: 回响应失败：{err}");
+        log::error!("回响应失败：{err}");
     }
 }
 
@@ -273,7 +283,7 @@ mod tests {
     use super::*;
     use crate::protocol::PROTOCOL_VERSION;
     use crate::session::Setup;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     use std::collections::BTreeSet;
     use std::net::TcpListener;
 
@@ -289,6 +299,8 @@ mod tests {
         seen: Arc<Mutex<Vec<String>>>,
         /// 是否被要求退出。
         exited: Arc<Mutex<bool>>,
+        /// 排出的提醒。
+        alerts: Arc<Mutex<Vec<AlertRequest>>>,
     }
 
     impl Harness {
@@ -306,6 +318,11 @@ mod tests {
         /// 是否被要求退出。
         fn exited(&self) -> bool {
             *self.exited.lock().expect("锁未中毒")
+        }
+
+        /// 排出的提醒。
+        fn alerts(&self) -> Vec<AlertRequest> {
+            self.alerts.lock().expect("锁未中毒").clone()
         }
     }
 
@@ -325,6 +342,8 @@ mod tests {
         let sink = Arc::clone(&seen);
         let exited = Arc::new(Mutex::new(false));
         let exit_flag = Arc::clone(&exited);
+        let alerts = Arc::new(Mutex::new(Vec::new()));
+        let alert_sink = Arc::clone(&alerts);
         let hooks = Arc::new(Hooks {
             display: Box::new(move |directive| {
                 sink.lock().expect("锁未中毒").push(directive.animation);
@@ -332,13 +351,85 @@ mod tests {
             exit: Box::new(move || {
                 *exit_flag.lock().expect("锁未中毒") = true;
             }),
+            alert: Box::new(move |request| {
+                alert_sink.lock().expect("锁未中毒").push(request);
+            }),
         });
         Harness {
             sessions: Arc::new(Mutex::new(session)),
             hooks,
             seen,
             exited,
+            alerts,
         }
+    }
+
+    /// 纯 Codex 包也要能提醒：`agent/settled` 是跳包通用的语义。
+    ///
+    /// 这条行钉住一个真实回归：会话层曾按 `has_rules()` 短路，
+    /// 于是没有规则表的包永远拿不到默认提醒——而绝大多数现成包都没有规则表。
+    #[test]
+    fn codex_only_pack_still_gets_the_default_alert() {
+        let harness = harness();
+        harness.post(hello());
+        harness.post(json!({
+            "jsonrpc": "2.0",
+            "method": "agent/settled",
+            "params": { "host": "pi", "sessionId": "s1" }
+        }));
+
+        let alerts = harness.alerts();
+        assert_eq!(alerts.len(), 1, "agent/settled 应产生一条提醒");
+        assert_eq!(alerts[0].spec.sound.as_deref(), Some("Glass"));
+        assert_eq!(alerts[0].title, "LitePet");
+        assert_eq!(
+            alerts[0].body, "这一轮干完了",
+            "没有气泡可借就用事件自带的描述"
+        );
+    }
+
+    /// 失败的 `agent/end` 该提醒；成功的不该——屏幕上本来就在动，再响就成噪声了。
+    #[test]
+    fn only_a_failed_agent_end_alerts() {
+        let harness = harness();
+        harness.post(hello());
+        for success in [true, false] {
+            harness.post(json!({
+                "jsonrpc": "2.0",
+                "method": "agent/end",
+                "params": { "host": "pi", "success": success }
+            }));
+        }
+
+        let alerts = harness.alerts();
+        assert_eq!(alerts.len(), 1, "两次表态里只该有一次提醒");
+        assert_eq!(alerts[0].spec.sound.as_deref(), Some("Basso"));
+    }
+
+    /// 调用被拒就不该提醒：参数写错的 `agent/end` 不该把主人从桌子那头叫过来。
+    #[test]
+    fn a_rejected_call_does_not_alert() {
+        let harness = harness();
+        harness.post(hello());
+        // `success` 缺失是反序列化失败，整个调用会被拒。
+        harness.post(json!({
+            "jsonrpc": "2.0",
+            "method": "agent/end",
+            "params": { "host": "pi" }
+        }));
+        assert!(harness.alerts().is_empty());
+    }
+
+    /// 没打过招呼的宿主发来的事件不算数，也不该提醒。
+    #[test]
+    fn an_unregistered_host_cannot_alert() {
+        let harness = harness();
+        harness.post(json!({
+            "jsonrpc": "2.0",
+            "method": "agent/settled",
+            "params": { "host": "stranger", "sessionId": "s1" }
+        }));
+        assert!(harness.alerts().is_empty());
     }
 
     fn hello() -> Value {
@@ -376,9 +467,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_error_replies_with_null_id() {        let server = harness();
-        let reply = dispatch("{ 这不是 JSON", &server.sessions, &server.hooks)
-            .expect("应当有响应");
+    fn parse_error_replies_with_null_id() {
+        let server = harness();
+        let reply = dispatch("{ 这不是 JSON", &server.sessions, &server.hooks).expect("应当有响应");
         let reply: Value = serde_json::from_str(&reply).expect("响应应当是合法 JSON");
         assert_eq!(reply["error"]["code"], jsonrpc::PARSE_ERROR);
         assert_eq!(reply["id"], Value::Null, "解析失败时 id 必须是 null");
@@ -434,10 +525,7 @@ mod tests {
     fn instance_running_recognises_a_taken_port() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("应能占一个临时端口");
         let port = listener.local_addr().expect("应有本地地址").port();
-        assert!(
-            instance_running(port),
-            "端口已在本进程手里，应当被认出来"
-        );
+        assert!(instance_running(port), "端口已在本进程手里，应当被认出来");
 
         drop(listener);
         assert!(

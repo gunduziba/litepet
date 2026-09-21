@@ -2,7 +2,8 @@
 name = "litepet"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.77"
+# rodio 0.22 与 ureq 3 都要 1.87+；实际工具链是 1.98.
+rust-version = "1.87"
 description = "统一的桌面宠物 daemon，为 pi 与 dsh 宿主提供宠物显示"
 license = "Apache-2.0"
 
@@ -16,6 +17,21 @@ serde_json = "1"
 anyhow = "1"
 tiny_http = "0.12"
 getrandom = "0.3"
+log = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# 音效：关掉 default-features 是为了排除 `recording`（麦克风）。
+# 桌面宠物不需要麦克风，而一旦启用，macOS 上会牵出隐私权限与 entitlements。
+# `symphonia-aiff` 是 macOS 系统音效（/System/Library/Sounds/*.aiff）能播的前提。
+rodio = { version = "0.22", default-features = false, features = [
+    "playback",
+    "wav",
+    "vorbis",
+    "mp3",
+    "symphonia-aiff",
+] }
+tauri-plugin-notification = "2"
+# 手机推送：阻塞式，不引入 async 运行时；默认特性已含 rustls。
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [profile.release]
 codegen-units = 1

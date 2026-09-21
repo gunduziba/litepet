@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::behavior::{Behavior, BubbleSpec, Play, Stage};
-use crate::protocol::{DisplayBubble, DisplayDirective, BubbleKind, BUBBLE_TEXT_LIMIT, truncate};
+use crate::protocol::{truncate, BubbleKind, DisplayBubble, DisplayDirective, BUBBLE_TEXT_LIMIT};
 
 /// 反馈动画的展示时长（`docs/PROTOCOL.md` §5：`celebrating ≤ 8s`）。
 pub const FEEDBACK_MS: u64 = 8_000;
@@ -183,7 +183,31 @@ impl Arbiter {
 
     /// `agent.end`：成功/失败进入对应反馈，其余不动（`docs/PROTOCOL.md` §5）。
     pub fn on_agent_end(&mut self, host: &str, success: bool, now: Instant) {
-        let stage = if success { Stage::Success } else { Stage::Failure };
+        let stage = if success {
+            Stage::Success
+        } else {
+            Stage::Failure
+        };
+        if let Some(entry) = self.hosts.get_mut(host) {
+            entry.stage = HostStage::Feedback(stage);
+            entry.feedback_until = Some(now + Duration::from_millis(FEEDBACK_MS));
+            entry.override_play = None;
+            entry.last_event = now;
+        }
+    }
+
+    /// `agent/settled`：整轮结束且不会自动继续，进庆祝（`docs/PROTOCOL.md` §5）。
+    ///
+    /// 它与 `agent.end` 是**两个语义**，不能合并：一轮里每次工具回来的 `agent/end`
+    /// 都只算「这一步成了」，而 `agent/settled` 是「不用再等我了」。
+    /// 合成一个的话，「在键盘前等下一轮」的人会看到宠物反复庆祝。
+    pub fn on_agent_settled(&mut self, host: &str, success: Option<bool>, now: Instant) {
+        // `None` 意思是宿主没报过 `agent/end`。这时候按「完成」处理：
+        // `agent/settled` 本身就说明「不用再等我了」，给个失败的脸色是错的。
+        let stage = match success {
+            Some(false) => Stage::Failure,
+            _ => Stage::Celebrate,
+        };
         if let Some(entry) = self.hosts.get_mut(host) {
             entry.stage = HostStage::Feedback(stage);
             entry.feedback_until = Some(now + Duration::from_millis(FEEDBACK_MS));
@@ -208,7 +232,14 @@ impl Arbiter {
             (None, Some(text)) => (BubbleKind::Tool, text.to_string()),
             (None, None) => (BubbleKind::Tool, tool_name.to_string()),
         };
-        self.set_bubble(host, kind, &text, DEFAULT_BUBBLE_TTL_MS, Some(tool_name), now);
+        self.set_bubble(
+            host,
+            kind,
+            &text,
+            DEFAULT_BUBBLE_TTL_MS,
+            Some(tool_name),
+            now,
+        );
     }
 
     /// `tool.end`：只有两种情况下动气泡。
@@ -228,12 +259,26 @@ impl Arbiter {
         match (spec, is_error) {
             // 规则表给了气泡，规则优先。
             (Some(spec), _) => {
-                self.set_bubble(host, spec.kind, &spec.text, DEFAULT_BUBBLE_TTL_MS, Some(tool_name), now);
+                self.set_bubble(
+                    host,
+                    spec.kind,
+                    &spec.text,
+                    DEFAULT_BUBBLE_TTL_MS,
+                    Some(tool_name),
+                    now,
+                );
             }
             // `tool.end`(isError) → `error` 级气泡（`docs/PROTOCOL.md` §9.3）。
             // 无规则时只有工具名可作正文；`error` 优先级最高，可抢占未过期的低优先级气泡。
             (None, true) => {
-                self.set_bubble(host, BubbleKind::Error, tool_name, DEFAULT_BUBBLE_TTL_MS, None, now);
+                self.set_bubble(
+                    host,
+                    BubbleKind::Error,
+                    tool_name,
+                    DEFAULT_BUBBLE_TTL_MS,
+                    None,
+                    now,
+                );
             }
             // 成功结束：只刷新存活时间并释放去重键（让该工具再次开始能重新出气泡）。
             (None, false) => self.release_bubble_dedupe(host, now),
@@ -364,11 +409,7 @@ impl Arbiter {
 
     /// 距离最后一次任何事件过了多久。
     pub fn idle_for(&self, now: Instant) -> Duration {
-        let last = self
-            .hosts
-            .values()
-            .map(|entry| entry.last_event)
-            .max();
+        let last = self.hosts.values().map(|entry| entry.last_event).max();
         match last {
             // 一个宿主都没有时，用气泡轮换的起点兜底，避免立刻进入 resting。
             None => now.saturating_duration_since(self.rotate_since.unwrap_or(now)),
@@ -416,7 +457,11 @@ impl Arbiter {
     ) -> Option<String> {
         let candidates: Vec<String> = match behavior.group_members(group) {
             Some(members) if !members.is_empty() => members.to_vec(),
-            _ => known.iter().filter(|name| name.as_str() == group).cloned().collect(),
+            _ => known
+                .iter()
+                .filter(|name| name.as_str() == group)
+                .cloned()
+                .collect(),
         };
         if candidates.is_empty() {
             return None;
@@ -512,7 +557,11 @@ impl Arbiter {
             if let Some(until) = entry.feedback_until {
                 shrink(until.saturating_duration_since(now));
             }
-            if let Some(at) = entry.override_play.as_ref().and_then(|over| over.expires_at) {
+            if let Some(at) = entry
+                .override_play
+                .as_ref()
+                .and_then(|over| over.expires_at)
+            {
                 shrink(at.saturating_duration_since(now));
             }
             if let Some(bubble) = entry.bubble.as_ref() {
@@ -534,7 +583,11 @@ fn fallback_animation(known: &std::collections::BTreeSet<String>) -> String {
     if known.contains("idle") {
         return "idle".to_string();
     }
-    known.iter().next().cloned().unwrap_or_else(|| "idle".to_string())
+    known
+        .iter()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| "idle".to_string())
 }
 
 #[cfg(test)]
@@ -545,10 +598,17 @@ mod tests {
     use std::collections::BTreeSet;
 
     fn known() -> BTreeSet<String> {
-        ["idle", "working", "rest_tea", "rest_sleep", "celebrate", "sad"]
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect()
+        [
+            "idle",
+            "working",
+            "rest_tea",
+            "rest_sleep",
+            "celebrate",
+            "sad",
+        ]
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
     }
 
     fn behavior() -> Behavior {
@@ -599,7 +659,10 @@ mod tests {
         assert_eq!(during.animation, "celebrate");
 
         let after = now + Duration::from_millis(10 + FEEDBACK_MS + 1);
-        assert_eq!(arbiter.directive(after, &behavior, &known).animation, "idle");
+        assert_eq!(
+            arbiter.directive(after, &behavior, &known).animation,
+            "idle"
+        );
     }
 
     #[test]
@@ -613,10 +676,7 @@ mod tests {
         arbiter.on_tool_start("pi", "bash", None, None, now + Duration::from_millis(5));
         let directive = arbiter.directive(now + Duration::from_millis(10), &behavior, &known);
         assert_eq!(directive.animation, "working");
-        assert_eq!(
-            directive.bubble.expect("应带气泡").text,
-            "[pi] bash"
-        );
+        assert_eq!(directive.bubble.expect("应带气泡").text, "[pi] bash");
     }
 
     #[test]
@@ -650,7 +710,11 @@ mod tests {
         let before = arbiter.directive(now + Duration::from_millis(89_999), &behavior, &known);
         assert_eq!(before.animation, "idle");
         let after = arbiter.directive(now + Duration::from_millis(90_001), &behavior, &known);
-        assert!(after.animation.starts_with("rest_"), "实际为 {}", after.animation);
+        assert!(
+            after.animation.starts_with("rest_"),
+            "实际为 {}",
+            after.animation
+        );
     }
 
     #[test]
@@ -663,7 +727,11 @@ mod tests {
         let base = now + Duration::from_millis(90_001);
         let first = arbiter.directive(base, &behavior, &known).animation;
         let second = arbiter
-            .directive(base + Duration::from_millis(GROUP_ROTATE_MS + 1), &behavior, &known)
+            .directive(
+                base + Duration::from_millis(GROUP_ROTATE_MS + 1),
+                &behavior,
+                &known,
+            )
             .animation;
         assert_ne!(first, second, "组内应轮换");
     }
@@ -676,12 +744,16 @@ mod tests {
         let first = arbiter.current_bubble(now).expect("应有一条气泡");
         // 尚未过期且同键 → 不重发（刷新后文本相同即视为未重发）。
         arbiter.on_tool_start("pi", "bash", None, None, now + Duration::from_millis(10));
-        let second = arbiter.current_bubble(now + Duration::from_millis(10)).expect("仍有气泡");
+        let second = arbiter
+            .current_bubble(now + Duration::from_millis(10))
+            .expect("仍有气泡");
         assert_eq!(first.text, second.text);
 
         // 不同工具名则覆盖。
         arbiter.on_tool_start("pi", "read", None, None, now + Duration::from_millis(20));
-        let third = arbiter.current_bubble(now + Duration::from_millis(20)).expect("应有气泡");
+        let third = arbiter
+            .current_bubble(now + Duration::from_millis(20))
+            .expect("应有气泡");
         assert_eq!(third.text, "[pi] read");
     }
 
@@ -694,7 +766,9 @@ mod tests {
         let mut arbiter = arbiter_with("pi", now);
         arbiter.on_tool_start("pi", "bash", None, Some("ls -la"), now);
         arbiter.on_tool_end("pi", "bash", false, None, now + Duration::from_millis(10));
-        let bubble = arbiter.current_bubble(now + Duration::from_millis(20)).expect("应有气泡");
+        let bubble = arbiter
+            .current_bubble(now + Duration::from_millis(20))
+            .expect("应有气泡");
         assert_eq!(bubble.text, "[pi] ls -la");
     }
 
@@ -705,7 +779,9 @@ mod tests {
         let mut arbiter = arbiter_with("pi", now);
         arbiter.on_tool_start("pi", "bash", None, Some("ls -la"), now);
         arbiter.on_tool_end("pi", "bash", true, None, now + Duration::from_millis(10));
-        let bubble = arbiter.current_bubble(now + Duration::from_millis(20)).expect("应有气泡");
+        let bubble = arbiter
+            .current_bubble(now + Duration::from_millis(20))
+            .expect("应有气泡");
         assert_eq!(bubble.kind, "error");
         assert_eq!(bubble.text, "[pi] bash");
     }
@@ -717,11 +793,25 @@ mod tests {
         let mut arbiter = arbiter_with("pi", now);
         arbiter.on_tool_start("pi", "bash", None, Some("ls -la"), now);
         // TTL 内同键同文本：被去重，仍是同一条。
-        arbiter.on_tool_start("pi", "bash", None, Some("ls -la"), now + Duration::from_millis(5));
+        arbiter.on_tool_start(
+            "pi",
+            "bash",
+            None,
+            Some("ls -la"),
+            now + Duration::from_millis(5),
+        );
         arbiter.on_tool_end("pi", "bash", false, None, now + Duration::from_millis(10));
         // 结束后同键再次开始：文本应能换成新的。
-        arbiter.on_tool_start("pi", "bash", None, Some("pytest"), now + Duration::from_millis(15));
-        let bubble = arbiter.current_bubble(now + Duration::from_millis(20)).expect("应有气泡");
+        arbiter.on_tool_start(
+            "pi",
+            "bash",
+            None,
+            Some("pytest"),
+            now + Duration::from_millis(15),
+        );
+        let bubble = arbiter
+            .current_bubble(now + Duration::from_millis(20))
+            .expect("应有气泡");
         assert_eq!(bubble.text, "[pi] pytest");
     }
 
@@ -746,7 +836,9 @@ mod tests {
         let mut arbiter = arbiter_with("pi", now);
         arbiter.on_bubble("pi", BubbleKind::Error, "炸了", Some(10_000), now);
         arbiter.on_tool_start("pi", "bash", None, None, now + Duration::from_millis(1));
-        let bubble = arbiter.current_bubble(now + Duration::from_millis(2)).expect("应有气泡");
+        let bubble = arbiter
+            .current_bubble(now + Duration::from_millis(2))
+            .expect("应有气泡");
         assert_eq!(bubble.text, "[pi] 炸了");
         assert_eq!(bubble.kind, "error");
     }
@@ -769,8 +861,12 @@ mod tests {
         let mut arbiter = arbiter_with("pi", now);
         // 低于下限 → 抬到 500ms。
         arbiter.on_bubble("pi", BubbleKind::Info, "hi", Some(1), now);
-        assert!(arbiter.current_bubble(now + Duration::from_millis(400)).is_some());
-        assert!(arbiter.current_bubble(now + Duration::from_millis(600)).is_none());
+        assert!(arbiter
+            .current_bubble(now + Duration::from_millis(400))
+            .is_some());
+        assert!(arbiter
+            .current_bubble(now + Duration::from_millis(600))
+            .is_none());
     }
 
     #[test]
@@ -814,7 +910,10 @@ mod tests {
         let only_sad: BTreeSet<String> = ["sad"].iter().map(|s| (*s).to_string()).collect();
         // 纯 Codex 包且缺 idle：不能返回空动画名给渲染层。
         let behavior = Behavior::new(None, &only_sad).expect("应降级成功");
-        assert_eq!(arbiter.directive(now, &behavior, &only_sad).animation, "sad");
+        assert_eq!(
+            arbiter.directive(now, &behavior, &only_sad).animation,
+            "sad"
+        );
     }
 
     /// 心跳必须不能把睡着的宠物叫醒：`touch` 只动 `last_seen`。
@@ -833,7 +932,10 @@ mod tests {
         }
 
         // idleTimeoutMs = 90s，心跳不该阻止进入 resting。
-        assert_eq!(arbiter.directive(at, &behavior, &known).animation, "rest_tea");
+        assert_eq!(
+            arbiter.directive(at, &behavior, &known).animation,
+            "rest_tea"
+        );
     }
 
     #[test]
@@ -843,7 +945,9 @@ mod tests {
         let timeout = Duration::from_secs(60);
         let at = now + Duration::from_secs(45);
         arbiter.touch("pi", at);
-        assert!(arbiter.reap_dead(at + Duration::from_secs(10), timeout).is_empty());
+        assert!(arbiter
+            .reap_dead(at + Duration::from_secs(10), timeout)
+            .is_empty());
         assert_eq!(arbiter.host_count(), 1);
     }
 

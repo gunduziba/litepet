@@ -73,6 +73,7 @@
 | `host/bye` | `reason?` | 主动注销，立即生效不等超时 |
 | `agent/start` | `sessionId?`, `summary?` | 该宿主的 agent 开始干活 |
 | `agent/end` | `sessionId?`, `success: bool` | 该宿主的 agent 结束 |
+| `agent/settled` | `sessionId?` | 该宿主的 agent **彻底结束，不会再自动继续**（通知）。与 `agent/end` 的区别是**确定性**：宿主可能自动重试、压缩后重试、或继续处理排队消息，这种情形只发 `agent/end`。**不带 `success`**（结果由 daemon 自己记上次 `agent/end`） |
 | `tool/start` | `toolName`, `bubble?` | 工具开始；`bubble` 可选文本（建议 ≤48 字符，超长由 daemon 截断） |
 | `tool/end` | `toolName`, `isError?` | 工具结束 |
 | `pet/bubble` | `kind: "info"\|"status"\|"tool"\|"success"\|"warning"\|"error"`, `text`, `ttlMs?` | 直接发一条气泡 |
@@ -91,7 +92,7 @@
 
 ### 2.3 仲裁规则（M1 实现最小版，M3 打磨）
 
-- 维护**每宿主状态机**：`idle → working → (agent.end) → celebrating(≤8s) → idle`
+- 维护**每宿主状态机**：`idle → working → (agent.end) → celebrating/failed(≤8s) → idle`；`agent/settled` 同样进这两个状态之一，结果与上次 `agent/end` 相同则不重复推送
 - 显示优先级：最近一次事件的宿主优先（last-event-wins）
 - 聚合降级：若两个宿主都 working，宠物保持「打字」动画，气泡轮换显示最近工具调用，气泡文本带宿主徽章前缀（`[pi]` / `[dsh]`）
 - 气泡规则（照搬 Vetta）：`ttlMs` 默认 4s；`dedupeKey`（tool.start 气泡用 toolName 做去重键，避免连发）；正文截断 48 字符、详情截断 120 字符
@@ -236,7 +237,7 @@ Vetta 原素材是 8 个 VP9 + alpha 的 webm（302 帧 / 10.066s / 30fps / 576�
 
 ### 3.8 宠物包与可扩展性
 
-动作词表、素材布局、行为规则全部由**宠物包 manifest** 声明，不在代码里写死。完整契约见 **`docs/PET-PACK.md`**（v0.2，采用 **Codex 包格式**；§2 目录约定、§3 规格已定稿，§5 图集单格尺寸、§4.4 降级映射待定）。本节只列要点。
+动作词表、素材布局、行为规则全部由**宠物包 manifest** 声明，不在代码里写死。完整契约见 **`docs/PET-PACK.md`**（采用 **Codex 包格式**；§2 目录约定、§3 规格、§4.4 降级映射、§4.5 提醒均已成文）。本节只列要点。
 
 三层模型：
 
@@ -251,6 +252,33 @@ L3 是唯一能把 §3.4 「策略逻辑要手写 Rust」这条成本压下去�
 **硬性要求：加载期校验，声明了但不可达的动作 id 必须拒绝加载。**
 
 依据：PetPal Desktop 的格式允许任意动作名，但运行时只播硬编码子集——演示包声明了 `sit: [9,12]`、目录里有 `actions/look_right/`，而在 `src/main.js` 里按名统计 `sit`、`look` 各为 **0 次命中**，永远不会被触发；`anchor`、`sounds`、`portrait` 同样 0 次命中，`personality.catchphrases` 只写不读。**死 schema 比直接不支持更糟**，因为用户会以为能用。详见 `docs/PET-PACK.md` §0.1。
+
+### 3.9 提醒（Alert）
+
+宠物解决的是「人在屏幕前」时的信息传达；人端着咖啡走开时，它无能为力。提醒层就是补这个缺口：把规则表命中事件的**声音 / 系统通知 / 手机推送**发出去。
+
+**为什么是原生实现而不是 webview API**：v1 先用 Tauri 的系统通知（`tauri-plugin-notification`）、Rust 侧音频（`rodio`）与 HTTP（`ureq`，同步、不引 async 运行时），换取「一套代码同时出 macOS/Windows 安装包」的路径。完整契约见 `docs/PET-PACK.md` §4.5（规则字段与音效解析）与 §4.6（为什么“人在不在”不由 litepet 判断）。
+
+> 音效解码依赖 `rodio` 的 `symphonia-aiff` 特性：macOS 的系统音效是 `/System/Library/Sounds/*.aiff`，不开这个特性则所有系统音效都是静音的。`rodio` 关掉了 `default-features`（为了排除 `recording`）——桌面宠物不需要麦克风，而一旦启用，macOS 上会牵出隐私权限与 entitlements。
+
+三条硬约束：
+
+1. **提醒是旁路**。任何一步配错（Bark 密钥写错、系统没装该音效、用户关了通知权限）只让那一项失效，绝不拖累宠物本身，也绝不拖累其他通道。
+2. **提醒不能卡住宿主**。推送要出网、开音频设备要等解码器，而宿主正等 HTTP 应答，所以提醒一律丢到后台线程，HTTP 线程只排队就返回。
+3. **提醒内容不得为空**。没有气泡可借时用事件自带的一句话（如 `agent.settled` → 「这一轮干完了」），宁可发一条没信息量的通知，也不要静默不发。
+
+**提醒强度不由 litepet 判断**。“人在不在”是宿主自己的事（pi/dsh 自己就是前台进程，还知道会话状态；litepet 要拿到这些只能起子进程问系统，还得维护一份必然漏的终端白名单）。所以 litepet 不问在场，只按规则表与全局开关发通知：**规格要什么就发什么，三个通道彼此独立**。理由与取舍见 `docs/PET-PACK.md` §4.6。
+
+配置全在 `~/.litepet/config.json` 的 `notify` 块（总开关、音量、推送凭据）：**逐事件的映射刻意不进配置**，它属于宠物包的规则表——两边各管一份只会互相矛盾。`config.json` 里的设备密钥是明文，所以文件以 `0600` 写入。
+
+### 3.10 日志
+
+- 输出到 `~/.litepet/logs/daemon.log`，并镜像到 `stderr`（前台跑时直接看得见）。
+- 单文件上限 `5 MiB`，超过就把当前日志转存为 `daemon.log.1` 后重开；**只保留最近一份**（覆盖旧的 `.1`），避免长期运行把磁盘吃满。
+- 不自引日志库：格式与轮转都在 `src/logging.rs` 里，依赖只有 `log` 与 `chrono`。
+- 日志是适配器作者唯一的排错线索：适配器与 daemon 分属两个仓库，对面看不到任何 daemon 异常。所以凡是被静默降级的输入（未知 `bubble.kind`、未登记宿主的事件、找不到的音效）**必须**留下一条日志。
+
+> 教训（`docs/PROTOCOL.md` §4.1）：未知 `bubble.kind` 不拒绝是刻意的，但正因为不拒绝，错误会**静默**，日志就是它的唯一出口。
 
 ## 4. 宿主适配器的职责边界
 
@@ -336,10 +364,11 @@ L3 是唯一能把 §3.4 「策略逻辑要手写 Rust」这条成本压下去�
 |---|---|---|
 | M0 | 仓库初始化 + 本文档入库 + 协议 v1 定稿 | `docs/PROTOCOL.md` 与本文 §2 一致；CI（fmt/clippy/build）跑通 |
 | M1 | Tauri daemon：透明窗 + animated WebP 播放 + HTTP server + 状态机最小版 | `node scripts/host-sim.mjs` 演完整会话：宠物切打字动画 → 出气泡 → `agent/end` 后举杠铃 → 道别后 linger 30s 退出并删掉 `daemon.json`；二次启动检测单例 |
-| M2 | 协议层可被真实宿主驱动（本仓库只做到这一步） | `node scripts/host-sim.mjs` 演完整会话全部通过；“宿主侧适配器”已移出本仓库，另在独立仓库验收（pi：`~/tools/pi-pet-adapter`） |
+| M2 | 协议层可被真实宿主驱动（本仓库只做到这一步） | `node scripts/host-sim.mjs` 演完整会话全部通过；“宿主侧适配器”已移出本仓库，另在独立仓库验收（`~/tools/litepet-adapter-ts`） |
 | M3 | 点击穿透 + 拖拽/缩放/右键菜单 + 位置持久化 | 宠物不挡下层点击；点中宠物可拖可缩；重启后位置保留 |
 | M4 | dsh 适配器（独立仓库） | 与 M2 同标准在 dsh 上验收；pi+dsh 同时跑时仲裁与徽章正确 |
 | M5 | 打磨：省电、气泡换肤 JSON、`--resident`、登录自启、dmg 打包 | 手工清单逐项过 |
+| M6 | 提醒层：规则表驱动的音效 / 系统通知 / 手机推送（§3.9） | 宿主发 `agent/settled` 时出声并弹通知；已配 Bark 时同一条规则也推手机；任一通道配错不影响其余两个 |
 
 每完成一个里程碑：git commit（中文 commit message）+ 在本文档勾选状态。
 

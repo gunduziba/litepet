@@ -6,7 +6,7 @@
 //! 因此本模块可以完全脱离网络单测。
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// 协议版本，固定为 `1`（`docs/PROTOCOL.md` §3）。
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -34,6 +34,15 @@ pub mod method {
     pub const AGENT_START: &str = "agent/start";
     /// `agent/end`：该宿主的 agent 结束。通知。
     pub const AGENT_END: &str = "agent/end";
+    /// `agent/settled`：该宿主的 agent 彻底结束，不会再自动继续。通知。
+    ///
+    /// 与 `agent/end` 的区别是**确定性**：一轮跑完之后，宿主可能自动重试、
+    /// 自动压缩后重试，或继续处理排队中的后续消息（pi 的 `agent_end` 即如此），
+    /// 所以 `agent/end` 只说明「这一轮结束了」，`agent/settled` 才说明「不会再有下一轮」。
+    ///
+    /// 要做「任务完成，可以来看结果了」这类提醒**必须**用本方法：
+    /// 用 `agent/end` 会在自动重试的中途误报完成。
+    pub const AGENT_SETTLED: &str = "agent/settled";
     /// `tool/start`：工具开始。通知。
     pub const TOOL_START: &str = "tool/start";
     /// `tool/end`：工具结束。通知。
@@ -55,6 +64,7 @@ pub fn rule_event(method: &str) -> Option<&'static str> {
     match method {
         method::AGENT_START => Some("agent.start"),
         method::AGENT_END => Some("agent.end"),
+        method::AGENT_SETTLED => Some("agent.settled"),
         method::TOOL_START => Some("tool.start"),
         method::TOOL_END => Some("tool.end"),
         method::PET_BUBBLE => Some("bubble"),
@@ -120,6 +130,22 @@ pub struct AgentEnd {
     pub host: String,
     /// 是否成功。
     pub success: bool,
+    /// 会话 id，仅用于日志。
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// `agent/settled` 的参数。
+///
+/// **不带 `success`**：宿主能观察到的只是「不会再自动继续」这一个事实，
+/// 成功与否属于 `agent/end` 的语义。逼宿主在这里重复上报，等于逼它自己编一个值
+/// （pi 的 `agent_settled` 事件里就没有这个字段），而协议明令禁止宿主发送不确信的信息。
+/// daemon 自己记着每个宿主最近一次 `agent/end` 的结果，用它决定「庆祝」还是「失败」。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSettled {
+    /// 宿主标识。
+    pub host: String,
     /// 会话 id，仅用于日志。
     #[serde(default)]
     pub session_id: Option<String>,
@@ -307,8 +333,7 @@ mod tests {
 
     #[test]
     fn hello_parses_with_optional_fields_absent() {
-        let msg: HostHello = serde_json::from_value(params(r#"{"host":"pi"}"#))
-            .expect("应能解析");
+        let msg: HostHello = serde_json::from_value(params(r#"{"host":"pi"}"#)).expect("应能解析");
         assert_eq!(msg.host, "pi");
         assert_eq!(msg.protocol_version, PROTOCOL_VERSION, "缺省应为当前版本");
         assert!(msg.pid.is_none());
@@ -321,29 +346,46 @@ mod tests {
     }
 
     #[test]
-    fn tool_start_parses_camel_case() {
-        let msg: ToolStart =
-            serde_json::from_value(params(r#"{"host":"pi","toolName":"bash","bubble":"跑测试"}"#))
+    fn agent_settled_parses_without_success() {
+        // 成功与否不属于本方法的语义：带上也不能因此解析失败。
+        let msg: AgentSettled =
+            serde_json::from_value(params(r#"{"host":"pi","sessionId":"s1","success":true}"#))
                 .expect("应能解析");
+        assert_eq!(msg.host, "pi");
+        assert_eq!(msg.session_id.as_deref(), Some("s1"));
+
+        // 只给 host 也要能解析。
+        let minimal: AgentSettled =
+            serde_json::from_value(params(r#"{"host":"dsh"}"#)).expect("应能解析");
+        assert!(minimal.session_id.is_none());
+
+        // host 仍是必需字段。
+        assert!(serde_json::from_value::<AgentSettled>(params(r#"{}"#)).is_err());
+    }
+
+    #[test]
+    fn tool_start_parses_camel_case() {
+        let msg: ToolStart = serde_json::from_value(params(
+            r#"{"host":"pi","toolName":"bash","bubble":"跑测试"}"#,
+        ))
+        .expect("应能解析");
         assert_eq!(msg.tool_name, "bash");
         assert_eq!(msg.bubble.as_deref(), Some("跑测试"));
     }
 
     #[test]
     fn tool_end_parses_is_error() {
-        let msg: ToolEnd = serde_json::from_value(params(
-            r#"{"host":"pi","toolName":"bash","isError":true}"#,
-        ))
-        .expect("应能解析");
+        let msg: ToolEnd =
+            serde_json::from_value(params(r#"{"host":"pi","toolName":"bash","isError":true}"#))
+                .expect("应能解析");
         assert_eq!(msg.is_error, Some(true));
     }
 
     #[test]
     fn bubble_kind_parses_from_lowercase() {
-        let msg: PetBubble = serde_json::from_value(params(
-            r#"{"host":"pi","kind":"warning","text":"注意"}"#,
-        ))
-        .expect("应能解析");
+        let msg: PetBubble =
+            serde_json::from_value(params(r#"{"host":"pi","kind":"warning","text":"注意"}"#))
+                .expect("应能解析");
         assert_eq!(msg.kind, BubbleKind::Warning);
         assert_eq!(msg.kind.as_str(), "warning");
     }
@@ -351,10 +393,9 @@ mod tests {
     #[test]
     fn bubble_kind_degrades_instead_of_rejecting_unknown() {
         // 适配器独立演进：新 kind 必须能被接住，否则整条通知被丢且适配器无从得知。
-        let msg: PetBubble = serde_json::from_value(params(
-            r#"{"host":"pi","kind":"celebrate","text":"交卷"}"#,
-        ))
-        .expect("未知 kind 不应导致整条消息解析失败");
+        let msg: PetBubble =
+            serde_json::from_value(params(r#"{"host":"pi","kind":"celebrate","text":"交卷"}"#))
+                .expect("未知 kind 不应导致整条消息解析失败");
         assert_eq!(msg.kind, BubbleKind::Unknown);
         assert_eq!(msg.kind.as_str(), "unknown");
         assert_eq!(msg.text, "交卷", "气泡正文仍要保留");
@@ -388,6 +429,7 @@ mod tests {
     fn rule_event_maps_methods_to_pack_vocabulary() {
         assert_eq!(rule_event(method::TOOL_START), Some("tool.start"));
         assert_eq!(rule_event(method::AGENT_END), Some("agent.end"));
+        assert_eq!(rule_event(method::AGENT_SETTLED), Some("agent.settled"));
         assert_eq!(rule_event(method::PET_BUBBLE), Some("bubble"));
         // 非事件类方法不参与规则匹配。
         assert_eq!(rule_event(method::HOST_HELLO), None);

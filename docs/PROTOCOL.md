@@ -121,6 +121,7 @@ daemon 在**端口绑定成功之后**写出端点文件，宿主读它拿端口
 | `host/bye` | 通知 | `reason?: string` | 主动注销；daemon 立即注销该宿主，不等心跳超时 |
 | `agent/start` | 通知 | `sessionId?: string`, `summary?: string` | 该宿主的 agent 开始干活 |
 | `agent/end` | 通知 | `success: boolean`, `sessionId?: string` | 该宿主的 agent 结束 |
+| `agent/settled` | 通知 | `sessionId?: string` | 该宿主的 agent **彻底结束，不会再自动继续**（见下） |
 | `tool/start` | 通知 | `toolName: string`, `bubble?: string` | 工具开始；`bubble` 为可选展示文本，**建议 ≤ 48 字符**，超长由 daemon 截断 |
 | `tool/end` | 通知 | `toolName: string`, `isError?: boolean` | 工具结束 |
 | `pet/bubble` | 通知 | `kind: "info"\|"status"\|"tool"\|"success"\|"warning"\|"error"`（未知值降级，见下）, `text: string`, `ttlMs?: number` | 直接发一条气泡 |
@@ -130,6 +131,11 @@ daemon 在**端口绑定成功之后**写出端点文件，宿主读它拿端口
 - `sessionId` 仅用于日志，daemon 不做多会话区分（每宿主一个状态机）
 - 未 `host/hello` 就发事件：通知被静默忽略，请求回 `-32001`
 - `protocolVersion` **高于** daemon 支持（当前 `1`）→ `-32002`，该宿主不注册；**低于**则接受（前向兼容）
+
+**`agent/settled` 与 `agent/end` 是两个语义，不能合并**。区别在**确定性**：一轮跑完之后，宿主可能自动重试、自动压缩后重试，或继续处理排队中的后续消息（pi 的 `agent_end` 即如此）。这种「本轮完了但还会自己接着干」的情形，`agent/end` 每次都发，`agent/settled` 只在确定不会再动时发。
+
+- 它**不带 `success`**：宿主能观察到的只是「不会再自动继续」这一个事实，成功与否属于 `agent/end` 的语义。逼宿主在这里重报一次结果，等于逼它自己编一个值（pi 的 `agent_settled` 事件里就没有这个字段），而本协议明令禁止宿主发送不确信的信息。daemon 自己记着每个宿主最近一次 `agent/end` 的结果，用它决定停稳后是庆祝还是给失败脸色；宿主重连（再次 `host/hello`）时该记录作废。
+- 没有规则命中它时，daemon 走包通用默认提醒（出声 + 系统通知）。提醒是 **daemon 本地副作用**，不出现在线格式里，细节见 `docs/PET-PACK.md` §4.5。
 
 ### 4.1 适配器独立演进产生的容错（v1 已实现）
 
@@ -173,11 +179,13 @@ daemon 只在应答请求时说话，没有主动推送。
 
 ```text
 idle ──agent.start──► working ──agent.end(success)──► celebrating(≤8s) ──► idle
+                          │              │                   │
+                          │              └── 失败 ──► failed(≤8s) ┘
                           │                                  │
                           └── 长时间无事件 ──► resting 轮换 ◄──┘
 ```
 
-- `celebrating` 固定最长 8 秒，到点自动回 `idle`
+- `celebrating` / `failed` 固定最长 8 秒（`FEEDBACK_MS`），到点自动回舞台动画；`agent/settled` 同样进这两个状态之一，若与 `agent/end` 算出的结果相同则不重复推送
 - `tool.start` **不改变** working 状态，只更新气泡
 - 长时间（默认 90s，可被包的行为配置覆盖）无事件 → 进入 `resting`，在 resting 组动作间轮换
 
@@ -259,11 +267,14 @@ idle ──agent.start──► working ──agent.end(success)──► celebr
 | `tool/end`（成功） | 保持当前 | **不出气泡**（`toolName` 是去重键，不是展示文本） |
 | `agent/end`(success) | `feedback`：`stoat_stand_lift_barbell_one_hand_fast` | `success`：任务完成 |
 | `agent/end`(fail) | `feedback`：`stoat_wave_backflip_smoke_fade_exit` | `info`：任务失败 |
+| `agent/settled` | `feedback` 组：上次 `agent/end` 成功则庆祝，失败则给失败脸色 | **不出气泡**（除非规则声明；但默认会出声 + 系统通知，见下） |
 | 90s 无事件 | `resting` 组轮换 | — |
 
 > 上表是**内置包** `pet.json` 里 `litepet.behavior.rules` 的等价描述（规则表契约见 `docs/PET-PACK.md` §4.3）。外部包在自己 manifest 里覆盖；daemon 侧只做**通用规则解释器**，不把这套映射写死在 Rust 代码里。
 >
 > 纯 Codex 包（无 `litepet` 键）走 `docs/PET-PACK.md` §4.4 的降级映射表。
+
+**第三个通道：提醒**。上表只管屏幕上的宠物与气泡；提醒（声音 / 系统通知 / 手机推送）是**独立的旁路**，用不用它由规则表的 `alert` 字段决定（`docs/PET-PACK.md` §4.5）。没有规则命中时，有两个包通用的默认提醒：`agent/settled`（出声 + 通知）与失败的 `agent/end`。提醒内容没有气泡可借时用事件自带的一句话（如 `agent.settled` → 「这一轮干完了」），所以提醒永远不会是空壳。
 
 ## 10. 手工验证
 

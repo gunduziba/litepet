@@ -146,9 +146,8 @@ pub fn parse(body: &str) -> Result<Request, ErrorObject> {
         return Err(ErrorObject::new(INVALID_REQUEST, "不支持批量请求"));
     }
 
-    let request: Request = serde_json::from_value(value).map_err(|err| {
-        ErrorObject::new(INVALID_REQUEST, format!("请求对象非法：{err}"))
-    })?;
+    let request: Request = serde_json::from_value(value)
+        .map_err(|err| ErrorObject::new(INVALID_REQUEST, format!("请求对象非法：{err}")))?;
 
     if request.jsonrpc != VERSION {
         return Err(ErrorObject::new(
@@ -236,11 +235,15 @@ mod tests {
     fn failure_response_omits_result_member() {
         let response = Response::failure(
             Value::Null,
-            ErrorObject::new(METHOD_NOT_FOUND, "方法不存在").with_data(serde_json::json!({"method":"nope"})),
+            ErrorObject::new(METHOD_NOT_FOUND, "方法不存在")
+                .with_data(serde_json::json!({"method":"nope"})),
         );
         let body = response.to_body();
         assert!(body.contains(r#""error""#));
-        assert!(!body.contains(r#""result""#), "失败响应不得含 result：{body}");
+        assert!(
+            !body.contains(r#""result""#),
+            "失败响应不得含 result：{body}"
+        );
         assert!(body.contains(r#""id":null"#));
     }
 

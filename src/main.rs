@@ -19,19 +19,27 @@
 //! `Session` 是唯一的决策者，被工作线程与空转线程共享；
 //! Tauri 主线程只跑事件循环与几个命令。
 
+mod alert;
 mod arbiter;
 mod behavior;
 mod config;
 mod http;
 mod jsonrpc;
+mod logging;
 mod pack;
 mod protocol;
 mod session;
 
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
+
+use alert::desktop::TauriNotifier;
+use alert::push::{BarkPusher, Pusher, SilentPusher};
+use alert::sound::RodioSpeaker;
+use alert::{Alerter, Channels, Request};
+use config::NotifyConfig;
 
 /// 渲染层与 session 线程共用的宠物包。
 ///
@@ -51,7 +59,7 @@ fn pack_info(state: tauri::State<'_, PetState>) -> std::result::Result<pack::Pet
 /// 渲染层就绪握手：前端加载完宠物包后调用，便于确认宠物确实已上屏。
 #[tauri::command]
 fn renderer_ready(animations: usize) {
-    println!("litepet: 渲染层就绪，可用动画 {animations} 个");
+    log::info!("渲染层就绪，可用动画 {animations} 个");
 }
 
 /// 渲染层应用了一条指令后回报。
@@ -62,8 +70,8 @@ fn renderer_ready(animations: usize) {
 #[tauri::command]
 fn renderer_applied(animation: String, bubble: Option<String>) {
     match bubble {
-        Some(text) => println!("litepet: 渲染层已应用 动画={animation} 气泡={text}"),
-        None => println!("litepet: 渲染层已应用 动画={animation}"),
+        Some(text) => log::info!("渲染层已应用 动画={animation} 气泡={text}"),
+        None => log::info!("渲染层已应用 动画={animation}"),
     }
 }
 
@@ -73,7 +81,7 @@ fn pick_pack(root: &Path, preferred: Option<&str>) -> Option<String> {
         if root.join(id).join("pet.json").is_file() {
             return Some(id.to_string());
         }
-        eprintln!("litepet: 配置的宠物包不可用，回退到自动挑选：{id}");
+        log::warn!("配置的宠物包不可用，回退到自动挑选：{id}");
     }
     let mut ids: Vec<String> = std::fs::read_dir(root)
         .ok()?
@@ -89,17 +97,14 @@ fn pick_pack(root: &Path, preferred: Option<&str>) -> Option<String> {
 fn try_init_pet() -> Result<(pack::LoadedPet, u16)> {
     let (cfg, created) = config::load_or_init()?;
     if created {
-        println!(
-            "litepet: 已初始化家目录 {}",
-            config::home_dir()?.display()
-        );
+        log::info!("已初始化家目录 {}", config::home_dir()?.display());
     }
     let root = config::pets_dir()?;
     let id = pick_pack(&root, cfg.pet.as_deref())
         .with_context(|| format!("{} 下没有可用宠物包（需含 pet.json）", root.display()))?;
     let loaded = pack::load(&root, &id)?;
-    println!(
-        "litepet: 已加载宠物包 {}（{}），{} 个动画，网格 {}x{}x{}x{}",
+    log::info!(
+        "已加载宠物包 {}（{}），{} 个动画，网格 {}x{}x{}x{}",
         loaded.info.id,
         loaded.info.display_name,
         loaded.info.animations.len(),
@@ -108,10 +113,14 @@ fn try_init_pet() -> Result<(pack::LoadedPet, u16)> {
         loaded.info.frame.columns,
         loaded.info.frame.rows,
     );
-    match loaded.behavior.as_ref().and_then(|value| value.get("behavior")) {
-        Some(_) => println!("litepet: 已读取 litepet.behavior 扩展配置"),
+    match loaded
+        .behavior
+        .as_ref()
+        .and_then(|value| value.get("behavior"))
+    {
+        Some(_) => log::info!("已读取 litepet.behavior 扩展配置"),
         // 纯 Codex 包没有这个键，此时全走 §4.4 降级映射
-        None => println!("litepet: 无 litepet.behavior 扩展，使用 Codex 降级映射"),
+        None => log::info!("无 litepet.behavior 扩展，使用 Codex 降级映射"),
     }
     Ok((loaded, cfg.port))
 }
@@ -124,7 +133,7 @@ fn init_pet() -> (PetState, u16) {
     match try_init_pet() {
         Ok((loaded, port)) => (PetState(Mutex::new(Some(Arc::new(loaded)))), port),
         Err(err) => {
-            eprintln!("litepet: 宠物包加载失败：{err:#}");
+            log::error!("宠物包加载失败：{err:#}");
             (PetState(Mutex::new(None)), config::DEFAULT_PORT)
         }
     }
@@ -144,67 +153,106 @@ fn start_http(app: tauri::AppHandle, loaded: &pack::LoadedPet, port: u16, reside
     let session = match session::Session::new(setup) {
         Ok(session) => session,
         Err(err) => {
-            eprintln!("litepet: 行为配置非法，HTTP 服务未启动：{err:#}");
+            log::error!("行为配置非法，HTTP 服务未启动：{err:#}");
             return;
         }
     };
     if !session.has_rules() {
-        println!("litepet: 该包无规则表，动画由 Codex 降级映射决定");
+        log::info!("该包无规则表，动画由 Codex 降级映射决定");
     }
 
     // 先占端口再写对接信息：绑定失败就别留下一个指向死端口的文件。
     let server = match http::listen(port) {
         Ok(server) => server,
         Err(err) => {
-            eprintln!("litepet: {err:#}");
+            log::error!("{err:#}");
             // 单例是硬性约束（SPEC §0 约束 2）：没抢到端口就不能再开一只宠物。
             // 如果只是打条日志就继续跑，结果是一个永远收不到任何事件的僵尸窗口，
             // 而且它看起来和正常实例一模一样，最难排查。所以这里必须退出。
             if http::instance_running(port) {
-                println!("litepet: 已有实例在监听 127.0.0.1:{port}，本进程退出（单例）");
+                log::info!("已有实例在监听 127.0.0.1:{port}，本进程退出（单例）");
                 std::process::exit(0);
             }
-            eprintln!("litepet: 端口 {port} 上没有任何服务在监听，无法继续");
+            log::error!("端口 {port} 上没有任何服务在监听，无法继续");
             std::process::exit(1);
         }
     };
     let token = match config::random_token() {
         Ok(token) => token,
         Err(err) => {
-            eprintln!("litepet: {err:#}");
+            log::error!("{err:#}");
             return;
         }
     };
     match config::write_endpoint(protocol::PROTOCOL_VERSION, port, &token) {
-        Ok(path) => println!(
-            "litepet: 监听 http://127.0.0.1:{port}{}（对接信息 {}）",
+        Ok(path) => log::info!(
+            "监听 http://127.0.0.1:{port}{}（对接信息 {}）",
             http::RPC_PATH,
             path.display()
         ),
         Err(err) => {
-            eprintln!("litepet: {err:#}");
+            log::error!("{err:#}");
             return;
         }
     }
 
     let exit_app = app.clone();
+    // 提醒钩子要一个自己的 `AppHandle`（弹通知用），所以先把 `app` 克隆一份出来，
+    // 那个 `app` 本体稍后会被显示钩子吃掉。
+    let alert_app = app.clone();
     let hooks = Arc::new(http::Hooks {
         display: Box::new(move |directive| {
             if let Err(err) = app.emit("display", directive) {
-                eprintln!("litepet: 推送渲染层失败：{err}");
+                log::error!("推送渲染层失败：{err}");
             }
         }),
         exit: Box::new(move || {
             // 正常退出时收拾对接信息；失败只提示，不影响退出。
             if let Err(err) = config::remove_endpoint() {
-                eprintln!("litepet: {err:#}");
+                log::error!("{err:#}");
             }
             exit_app.exit(0);
         }),
+        alert: Box::new(build_alerter(alert_app, loaded.root.clone())),
     });
 
     // 会话交给工作线程与空转线程共享，主线程不再碰它。
     http::serve(server, Arc::new(Mutex::new(session)), token, hooks);
+}
+
+/// 组装提醒执行端，并返回给 HTTP 层用的钩子。
+///
+/// 提醒是**旁路**：任何一步配错（Bark 密钥写错、系统没装音效、用户关了通知）
+/// 都只该让那一条提醒失效，绝不能拖累宠物本身。所以这里所有失败都降级为日志。
+fn build_alerter(app: tauri::AppHandle, pack_root: PathBuf) -> impl Fn(Request) + Send + Sync {
+    let notify = config::load_or_init()
+        .map(|(cfg, _)| cfg.notify)
+        .unwrap_or_else(|err| {
+            log::warn!("读取提醒配置失败，按默认值处理：{err:#}");
+            NotifyConfig::default()
+        });
+    if !notify.enabled {
+        log::info!("提醒总开关是关的（config.json 的 notify.enabled）");
+    }
+    let pusher: Arc<dyn Pusher> = match BarkPusher::from_config(&notify.push) {
+        Ok(pusher) => Arc::new(pusher),
+        Err(err) => {
+            // 推送配错不该把声音和系统通知一起拖下水。
+            log::warn!("手机推送不可用，只发本机提醒：{err:#}");
+            Arc::new(SilentPusher)
+        }
+    };
+    let alerter = Alerter::new(
+        notify,
+        Some(pack_root),
+        Channels {
+            speaker: Arc::new(RodioSpeaker::spawn()),
+            notifier: Arc::new(TauriNotifier::new(app)),
+            pusher,
+        },
+    );
+    // `fire` 自己就是「丢给后台线程就返回」，所以这个钩子不会卡住 HTTP 工作线程。
+    move |request| alerter.fire(request)
 }
 
 /// 解析命令行：`--resident` 与 `--port`。
@@ -231,8 +279,20 @@ fn parse_args() -> (bool, Option<u16>) {
 
 fn main() {
     let (resident, port) = parse_args();
+    // 日志尽早装上：后面的启动诊断都要落盘。双击启动的 GUI 没有终端，stderr 等于丢。
+    if let Err(err) = logging::init() {
+        eprintln!("litepet: 日志初始化失败，本次只输出到 stderr：{err:#}");
+    }
+    match logging::log_path() {
+        Ok(path) => log::info!(
+            "v{} 启动，日志写入 {}",
+            env!("CARGO_PKG_VERSION"),
+            path.display()
+        ),
+        Err(_) => log::info!("v{} 启动", env!("CARGO_PKG_VERSION")),
+    }
     if resident {
-        println!("litepet: 常驻模式，全部宿主断开后不退出");
+        log::info!("常驻模式，全部宿主断开后不退出");
     }
     tauri::Builder::default()
         .setup(move |app| {
