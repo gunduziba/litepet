@@ -161,18 +161,35 @@ idle ──agent.start──► working ──agent.end(success)──► celebr
 
 ## 10. 手工验证
 
+**推荐用仓库里的零依赖模拟器**（宿主机上通常没装 socat）：
+
+```bash
+node scripts/host-sim.mjs --host pi --step 800     # 演完整会话
+node scripts/host-sim.mjs --host pi --keep-alive   # 演完保持连接，观察 linger
+```
+
+已装 socat 时也可以手工注入，但**必须把全部帧送进同一次调用**：
+
 ```bash
 SOCK="${LITEPET_HOME:-$HOME/.litepet}/daemon.sock"
-printf '%s\n' '{"v":1,"type":"host.hello","host":"test","pid":0}' | socat - UNIX-CONNECT:"$SOCK"
-printf '%s\n' '{"v":1,"type":"agent.start","host":"test"}'      | socat - UNIX-CONNECT:"$SOCK"
-printf '%s\n' '{"v":1,"type":"tool.start","host":"test","toolName":"bash","bubble":"跑测试"}' | socat - UNIX-CONNECT:"$SOCK"
-printf '%s\n' '{"v":1,"type":"agent.end","host":"test","success":true}' | socat - UNIX-CONNECT:"$SOCK"
+printf '%s\n' \
+  '{"v":1,"type":"host.hello","host":"test","pid":0}' \
+  '{"v":1,"type":"agent.start","host":"test"}' \
+  '{"v":1,"type":"tool.start","host":"test","toolName":"bash","bubble":"跑测试"}' \
+  '{"v":1,"type":"agent.end","host":"test","success":true}' \
+  | socat - UNIX-CONNECT:"$SOCK"
 ```
 
-也可以用仓库里的零依赖模拟器，它按顺序演完整会话并留出观察间隔：
+> ⚠️ **每次 `socat` 调用都是一条新连接**。写成四条独立命令（各发一帧）不行：只有
+> `host.hello` 那条会生效（注册宿主），其余三帧落在未注册的连接上，按协议 §3 被
+> 静默忽略，宠物完全不动。实测：四连接方式的 daemon 日志只有
+> `宿主 test 已接入` / `宿主 test 已断开`，没有任何动画切换。
+>
+> socat 也无法控制帧间隔（一次管全部写入），动作会一闪而过，要观察就
+> 用下面的模拟器。
 
-```bash
-node scripts/host-sim.mjs --host pi --step 800
-```
+预期：切「打字」→ 出气泡 → `agent.end` 举杠铃 → 连接关闭 → linger 30s 后 daemon 退出。
 
-预期：切「打字」→ 出气泡 → 断开后 `agent.end` 举杠铃 → 连接关闭 → linger 30s 后 daemon 退出。
+> 验证渲染层是否真的收到了指令，看 daemon 的 stdout：每应用一条都会打
+> `渲染层已应用 动画=... 气泡=...`。webview 的 console 在终端里看不到，
+> 而桌宠的典型故障恰好就是「窗口里什么都没有」，所以这条日志是必要的。
