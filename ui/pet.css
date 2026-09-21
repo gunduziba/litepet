@@ -15,6 +15,13 @@ body {
   cursor: grab;
 }
 
+/* 按住时换成抓握光标，否则看不出「这儿能拖」。
+   `:active` 会沿祖先链生效，所以 body 上这一条就够——点击目标其实是盖满窗口的 #pet，
+   它没自己声明 cursor，用的就是继承来的这一个值。 */
+body:active {
+  cursor: grabbing;
+}
+
 /* 图集视口：一格一格地移动 background-position。 */
 .pet {
   position: absolute;

@@ -35,9 +35,10 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, WindowEvent};
 
 use alert::desktop::TauriNotifier;
 use alert::push::{BarkPusher, Pusher, SilentPusher};
@@ -348,18 +349,98 @@ impl DaemonState {
 
     /// 把与窗口有关的那几项配置立刻作用到窗口上。
     fn apply_window(&self, cfg: &config::Config) {
-        let Some(window) = self.app.get_webview_window(MAIN_WINDOW) else {
-            log::warn!("找不到主窗口 {MAIN_WINDOW}，本次窗口相关改动未生效");
-            return;
-        };
-        if let Err(err) = window.set_always_on_top(cfg.always_on_top) {
-            log::warn!("设置置顶失败：{err}");
-        }
-        // 只改尺寸，不动位置：改尺寸时顺手把窗口挪走很难受。
-        if let Err(err) = window.set_size(tauri::LogicalSize::new(cfg.size, cfg.size)) {
-            log::warn!("设置窗口尺寸失败：{err}");
-        }
+        // 不动位置：改尺寸时顺手把窗口挪走很难受。
+        apply_window_config(&self.app, cfg, false);
     }
+}
+
+/// 把配置里的窗口项作用到窗口上。
+///
+/// `with_position` 决定要不要连位置一起摆过去：启动时要摆（重启后位置保留，
+/// SPEC.md:368 是 M3 的验收项），`config/set` 时不摆——理由同上。
+fn apply_window_config(app: &tauri::AppHandle, cfg: &config::Config, with_position: bool) {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+        log::warn!("找不到主窗口 {MAIN_WINDOW}，本次窗口相关改动未生效");
+        return;
+    };
+    if let Err(err) = window.set_always_on_top(cfg.always_on_top) {
+        log::warn!("设置置顶失败：{err}");
+    }
+    if let Err(err) = window.set_size(tauri::LogicalSize::new(cfg.size, cfg.size)) {
+        log::warn!("设置窗口尺寸失败：{err}");
+    }
+    if !with_position {
+        return;
+    }
+    let (Some(x), Some(y)) = (cfg.x, cfg.y) else {
+        return;
+    };
+    // 位置：`Moved` 与 `outer_position()` 给的是同一套**物理**坐标，但这条路上有个坑——
+    // `set_position(Physical(_))` 会先按 `window.scale_factor()` 换成逻辑坐标再交给系统，
+    // 而这个读在窗口刚建好时是 1.0（真值 2.0），于是请求物理 300 得到物理 600。
+    // 更糟的是 `Moved` 随后报 600并被写回配置，下次启动再翻一倍：窗口几轮后就飞出屏幕。
+    // 所以改走 `LogicalPosition` 这条不做换算的路，缩放率从显示器上取——那是不依赖窗口
+    // 是否已摆上屏幕的。（窗口若被拖到另一块不同缩放的屏上，用的仍是原来那块的值。）
+    let scale = window
+        .current_monitor()
+        .or_else(|_| window.primary_monitor())
+        .ok()
+        .flatten()
+        .map(|monitor| monitor.scale_factor())
+        .unwrap_or(1.0);
+    let logical = tauri::LogicalPosition::new(f64::from(x) / scale, f64::from(y) / scale);
+    if let Err(err) = window.set_position(logical) {
+        log::warn!("恢复窗口位置失败：{err}");
+    }
+}
+
+/// 启动时按配置摆好窗口。
+///
+/// tauri.conf.json 里写死的 220 与 `alwaysOnTop: true` 只是兜底值：用户改过的尺寸和
+/// 位置都在 config.json 里，不在启动时应用一次的话，改完设置一重启就全弹回去了。
+fn apply_startup_window(app: &tauri::AppHandle) {
+    match config::load_or_init() {
+        Ok((cfg, _)) => apply_window_config(app, &cfg, true),
+        Err(err) => log::warn!("读配置失败，窗口沿用 tauri.conf.json 的默认值：{err:#}"),
+    }
+}
+
+/// 窗口被拖动后把位置写回配置（SPEC.md:368「重启后位置保留」）。
+///
+/// `Moved` 在拖动过程中每秒会来几十条，逐条写盘既浪费又没必要，所以交给一个后台线程
+/// 合并：收到第一条后继续吃到「安静下来」为止，只落盘最后那个位置。
+fn remember_window_position(app: tauri::AppHandle) {
+    // 安静多久算落定。太短会写很多次，太长会让「快速拖完松手」的位置丢掉。
+    const QUIET: Duration = Duration::from_millis(300);
+    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+        log::warn!("找不到主窗口 {MAIN_WINDOW}，拖动后的位置不会被记住");
+        return;
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<(i32, i32)>();
+    window.on_window_event(move |event| {
+        if let WindowEvent::Moved(position) = event {
+            // 接收端已退出说明正在收尾，这里失败是正常的，不吵。
+            let _ = tx.send((position.x, position.y));
+        }
+    });
+    std::thread::spawn(move || {
+        while let Ok(mut latest) = rx.recv() {
+            while let Ok(next) = rx.recv_timeout(QUIET) {
+                latest = next;
+            }
+            if let Err(err) = store_position(latest) {
+                log::warn!("记住窗口位置失败：{err:#}");
+            }
+        }
+    });
+}
+
+/// 写回窗口位置。读-改-写：只动 `x`/`y`，不碰同一时刻别人改过的字段。
+fn store_position((x, y): (i32, i32)) -> Result<()> {
+    let (mut cfg, _) = config::load_or_init()?;
+    cfg.x = Some(x);
+    cfg.y = Some(y);
+    config::save(&cfg)
 }
 
 impl http::Daemon for DaemonState {
@@ -738,6 +819,9 @@ fn main() {
             // `start_http` 内部会 `manage` 那个共享句柄，所以得先拿到 `&state`。
             start_http(app.handle().clone(), &state, port, resident);
             app.manage(state);
+            // 尺寸、置顶与位置都以 config.json 为准，tauri.conf.json 里那份只是兜底。
+            apply_startup_window(app.handle());
+            remember_window_position(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

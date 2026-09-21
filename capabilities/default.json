@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "pet 窗口的默认权限：允许调用自定义命令、监听事件、经 asset 协议读取图集",
+  "description": "pet 窗口的默认权限：允许调用自定义命令、监听事件、经 asset 协议读取图集、拖动窗口",
   "windows": ["pet"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "core:window:allow-start-dragging"]
 }
