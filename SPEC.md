@@ -11,9 +11,11 @@
 - **pi**：TUI coding agent（本机已装，文档见 `~/tools/pi-web/node_modules/@earendil-works/pi-coding-agent/docs/`）
 - **dsh**：DeepSeek Harness（`github.com/deepseek-ai/deepseek-harness`，MIT，"Everything is a Plugin"，底层 Cordis 框架，文档 https://deepseek-harness.github.io/deepseek-harness/reference/ ）
 
-产品形态：屏幕角落一只**白鼬**，透明置顶小窗播放 webm 动画。agent 开始干活 → 切「打字」动画；任务完成 → 举杠铃庆祝；工具调用 → 头顶气泡显示工具名。pi 和 dsh 可同时接入，宠物按仲裁规则显示。
+产品形态：屏幕角落一只**白鼬**，透明置顶小窗播放 **animated WebP** 动画（素材格式决策见 §3.5）。agent 开始干活 → 切「打字」动画；任务完成 → 举杠铃庆祝；工具调用 → 头顶气泡显示工具名。pi 和 dsh 可同时接入，宠物按仲裁规则显示。
 
-参考实现：Open Vetta 仓库（本机 `/Users/eee/tools/open-vetta`）的桌宠。素材与核心算法直接搬运，具体清单见 §6。
+参考实现：Open Vetta 仓库（本机 `/Users/eee/tools/open-vetta`）的桌宠。核心算法直接搬运，具体清单见 §6；**素材需转码**（VP9 webm → animated WebP，见 §3.5、§7）。
+
+宠物形象**不写死**：动作词表、素材布局、行为规则全部由宠物包 manifest 声明，契约见 `docs/PET-PACK.md`（§3.8 为要点）。
 
 **硬性设计约束**（不可妥协）：
 
@@ -31,7 +33,7 @@
 │  pi.on(...) 事件适配     │      │    协议 v1         │  - 宿主注册表 + 心跳 + 仲裁          │
 └─────────────────────────┘      ├─────────────────► │  - 光标轮询 + 点击穿透（照搬 Vetta） │
 ┌─ dsh ───────────────────┐      │                   │ 前端(WebView)：                       │
-│ out-of-tree plugin      │ ─────┘                   │  - webm 透明视频播放 + 动作状态机     │
+│ out-of-tree plugin      │ ─────┘                   │  - animated WebP 帧动画 + 动作状态机  │
 │ bundle（Cordis 事件订阅）│                          │  - 气泡（TTL/dedupe/宿主徽章）        │
 └─────────────────────────┘                          │  - 拖拽/滚轮缩放                     │
                                                      └──────────────────────────────────────┘
@@ -47,7 +49,7 @@
 
 ## 2. 协议规范 v1（先定稿再写码）
 
-**传输**：Unix domain socket。路径规则：macOS 用 `~/Library/Application Support/pet-daemon/daemon.sock`，Linux 用 `$XDG_RUNTIME_DIR/pet-daemon.sock`（无 XDG_RUNTIME_DIR 则 `/tmp/pet-daemon-$UID.sock`）。Windows 走命名管道 `\\.\pipe\pet-daemon`（M5 再做）。
+**传输**：Unix domain socket。路径**统一为 `~/.litepet/daemon.sock`**：与 `config.json`／`pets/` 同处家目录，受 `LITEPET_HOME` 控制；路径长度远低于 macOS 的 104 字节 `sun_path` 上限，且不受 `$TMPDIR` 清理影响。Windows 走命名管道 `\\.\pipe\pet-daemon`（M5 再做）。
 
 **帧**：JSONL，`\n` 分隔，UTF-8。socket 文件被占用即视为 daemon 已运行（天然单例锁）。
 
@@ -115,7 +117,7 @@ pnpm create tauri-app   # 选 Vanilla TS 或 React（建议 React，Vetta 前端
 
 ### 3.3 点击穿透（核心算法，照搬 Vetta）
 
-**关键教训（Vetta `pet-window.ts:761` 原注释）**：窗口内透明像素区域**不要**使用「鼠标事件转发」类方案（Electron 的 `{forward:true}`）——转发会把 mousemove 送进宠物页面，CSS cursor 会在透明空隙上抢占下层应用的光标。**正确做法：窗口层做鼠标穿透，由 daemon 侧轮询全局光标位置 + 宠物视频 hitbox 矩形做命中检测，命中时临时关闭穿透。**
+**关键教训（Vetta `pet-window.ts:761` 原注释）**：窗口内透明像素区域**不要**使用「鼠标事件转发」类方案（Electron 的 `{forward:true}`）——转发会把 mousemove 送进宠物页面，CSS cursor 会在透明空隙上抢占下层应用的光标。**正确做法：窗口层做鼠标穿透，由 daemon 侧轮询全局光标位置 + 宠物 hitbox 矩形做命中检测，命中时临时关闭穿透。**
 
 搬运清单：
 
@@ -124,7 +126,8 @@ pnpm create tauri-app   # 选 Vanilla TS 或 React（建议 React，Vetta 前端
   - 远距离：`PET_MOUSE_POLL_FAR_MS = 100` ms
   - 「近」= 光标落在窗口外扩 `PET_MOUSE_POLL_PROXIMITY_PX = 240` px 的矩形内（`isPointNearRect`）
   - `nextPetMousePollMs({dragging, cursor, windowBounds})` 决定下轮间隔
-- 命中判定：光标 ∈ 视频 hitbox 矩形（前端把视频元素在屏幕坐标系的位置上报给 Rust 侧）→ 穿透关；否则穿透开
+- 命中判定：光标 ∈ 宠物 hitbox 矩形（前端把宠物图片元素在屏幕坐标系的位置上报给 Rust 侧）→ 穿透关；否则穿透开
+- **已知局限（不是 bug，是继承来的设计）**：命中检测是**包围盒**而非 alpha 轮廓——点到宠物旁边的透明空白角落也算命中。Vetta（`petVideoHitbox`）和 PiDeck（`isPointOverElement(videoRef.current, …)`）都是这么做的，**所以从视频改到图片不会让点击精度变差**；要改成像素级得额外做 alpha 采样，列为 M5 可选打磨项
 - macOS 光标位置获取：⚠️ 核对 Rust crate（`enigo` 的 mouse location 或 `core-graphics` CGEventSource）；Electron 用 `screen.getCursorScreenPoint()`，无权限要求，预期 Rust 同源 API 也无障碍，实测为准
 - 穿透开关：Tauri `set_ignore_cursor_events(true/false)`（⚠️ 核对 API 名）
 
@@ -134,7 +137,7 @@ pnpm create tauri-app   # 选 Vanilla TS 或 React（建议 React，Vetta 前端
 
 ```ts
 interface PetAction {
-  id: string;                    // 与文件名一致：`${id}.webm`
+  id: string;                    // 由宠物包 manifest 声明（§3.8 / `docs/PET-PACK.md`）；内置包恰好与文件名一致：`${id}.webp`
   groupId: "idle" | "working" | "resting" | "feedback";
   label: string;                 // 中文
   videoBaseSize: number;         // 基准显示尺寸 px
@@ -144,7 +147,9 @@ interface PetAction {
 
 动作清单与默认映射（源：`pet-actions.ts` + `session-event-action-policy.ts` 的 `DEFAULT_ACTION_BY_GROUP`）：
 
-| 组 | 动作 id（即文件名） | 默认 | autoDuration |
+> ⚠️ **本节表格已降级为「内置包示例」。** 现采用 **Codex 包格式**（`docs/PET-PACK.md` §3）：动画名由 `pet.json` 的 `animations` 声明、**与文件名解耦**，素材是**单张图集**而非逐动作文件。下表内置包恰好满足「动画名 = 素材文件名」，属巧合而非契约。
+
+| 组 | 动画名 | 默认 | autoDuration |
 |---|---|---|---|
 | idle | `stoat_spin_color_hula_hoop` | ✅ | 60–120s |
 | working | `stoat_work_laptop_typing_desk_cushion` | ✅ | 180–300s |
@@ -155,7 +160,8 @@ interface PetAction {
 | feedback | `stoat_stand_lift_barbell_one_hand_fast` | ✅ | 8–12s |
 | feedback | `stoat_wave_backflip_smoke_fade_exit` | | 3–5s |
 
-（注：上表 autoDuration 数值为设计建议值，Vetta 源码里只对部分动作定义了精确范围；以搬运源码时的实际值为准。）
+> 注 1：上表是**内置包**的动作清单，作为契约的示例数据，**不是不可扩展的固定词表**——外部包可声明任意动作 id（§3.8）。
+> 注 2：上表 autoDuration 数值为设计建议值，Vetta 源码里只对部分动作定义了精确范围；以搬运源码时的实际值为准。
 
 状态机规则（源：`session-event-action-policy.ts` + `PetApp.tsx`）：
 
@@ -164,22 +170,75 @@ interface PetAction {
 - 用户手动切动作（右键菜单）→ 保持 10 秒后交还自动模式（`USER_ACTION_HOLD_MS = 10_000`）
 - 前端展示节流：动作切换最小保持间隔（Vetta `usePetPresentationThrottle`，`PET_APP_PRESENTATION_MIN_HOLD_MS`），防止事件风暴导致动画狂跳
 
-### 3.5 视频与省电
+### 3.5 素材格式与播放（✅ 本机实测，非查文献）
 
-- webm 透明视频直接用 HTML `<video>`（Vetta 的 `PetVideoSurface.tsx` 同方案，webm 带 alpha 通道）
-- 锁屏/休眠暂停解码（Vetta `pet-idle-guard.ts` 用 Electron powerMonitor；Tauri 侧 ⚠️ 核对：监听系统睡眠/唤醒事件的插件或用 `tauri-plugin-window-state` 类生态，实在没有可先跳过，标注 TODO）
-- 视频加载失败降级：隐藏视频面，仅保留气泡（Vetta `failedVideoSrc` 逻辑）
+> **本节实测结论仍有效，但产物形态已变。** 本节证明的是「WebP 编解码路线可行、webm 不可行」；在新格式下最终产物是**单张图集** `spritesheet.webp`（打包见 `docs/PET-PACK.md` §5），播放方式从 `<img src=...>` 改为**按 `frames` 索引切图**。`<video>` 依然不能用。
+
+**结论：用 animated WebP，不用 webm。**
+
+Vetta 原素材是 8 个 VP9 + alpha 的 webm（302 帧 / 10.066s / 30fps / 576×576）。VP9 要带透明，做法是在一个 webm 里塞**两路流**（彩色 + alpha 灰度），文件头标 `ALPHA_MODE=1`，播放器必须同时解两路再逐像素合成。**Chromium 做了，WebKit 没做**——只解彩色那路，alpha 整条丢弃，透明区变成不透明。
+
+**实测方式**：Swift + WKWebView 测试台，红底页面里三个素材并排，`takeSnapshot` 后逐像素统计。
+
+| 素材 | 透出红底比例 | 左上角采样 RGBA | 结论 |
+|---|---|---|---|
+| static PNG (RGBA) — **对照组** | 78% | `(255,0,0,255)` | ✅ 测试台有效 |
+| **animated WebP (alpha)** | **76%** | `(255,0,0,255)` | ✅ 透明正常 |
+| **VP9 webm `<video>`** | **0%** | **`(0,0,0,255)` 纯黑** | ❌ 确认不透明 |
+
+对照组的意义：PNG 要是也不透，说明错的是测试台而不是 VP9；PNG 透了 → 那 0% + 纯黑是真结论。
+同类 bug 的修复至今未合：`WebKit/WebKit#64837 "VP9 with transparency plays back incorrectly"`（+608/-17，动 39 个文件）。
+
+- **播放方式**：**按 `frames` 索引切图集**（`background-position` 或 canvas，运行时模型见 `docs/PET-PACK.md` §3.5）。**不用 `<video>`**——WebP 不是视频容器。这一条直接消掉了原计划里的 codec 探测。（原方案「`<img>` 直接播 animated WebP」因改用图集而作废）
+- **转码工具链**：本机 `ffmpeg 8.1.1` **没有 webp 编码器**（`-encoders | grep webp` 为空），但 brew 装了完整 libwebp：`cwebp` / `img2webp` / `webpmux` / `dwebp` 在 `/opt/homebrew/bin`。用 `img2webp` 转。⚠️ 脚本尚未入库（见 §7 的缺口说明）
+- **省电**：锁屏/休眠暂停渲染（Vetta `pet-idle-guard.ts` 用 Electron powerMonitor；Tauri 侧 ⚠️ 核对：监听系统睡眠/唤醒事件的插件，或用 `tauri-plugin-window-state` 类生态，实在没有可先跳过并标 TODO）
+- **素材加载失败降级**：隐藏宠物面，仅保留气泡（Vetta `failedVideoSrc` 逻辑）
+
+**体积实测（8 个动作合计）**：
+
+| 方案 | 体积 | 备注 |
+|---|---|---|
+| 原 webm (VP9+alpha) | 4.98 MB | 最小，但 WKWebView 播不了 |
+| animated WebP — 200px/10fps/q80 | 3.81 MB | 比原视频还小 |
+| animated WebP — 288px/15fps/q80 | 9.35 MB | |
+| **animated WebP — 440px/12fps/q80** | **~12 MB** | 匹配 Retina 2x 的 220px 显示；曾是仓库采用的形态（`assets/pet-440/`，**现已移出仓库**） |
+| PNG 精灵图 288px/15fps | ~26 MB | |
+| APNG 288px/15fps | ~51 MB | 逐帧全量 |
+| 逐帧 PNG 序列 288px | ~107 MB | 排除 |
+
+> ⚠️ **素材缺口（M1 阻塞）**：`assets/` 已从工作区移除（8 个 webm 在 git 中标记为删除，WebP 产物与转码脚本移至 `/tmp/removed-vetta-assets/`）。**内置包目前无素材可打图集。** 需先定素材来源（重新引入这批素材并打图集，或换 CC0 素材），见 `docs/PET-PACK.md` §5 / §8。
+
+关于 animated WebP 的硬验证（供后续怀疑时复现）：动画确实在跑（0.5/1.5/2.5/3.5s 四点截图，相邻帧 34%–38% 像素在变）；结构正确（`webpinfo` 显示 `Alpha: 1, Animation: 1`，每帧带独立 `Chunk ALPH`）；alpha 是真数据（`webpmux -get frame 40` → `dwebp` 解出 206x225 with alpha）。
+⚠️ 坑：`dwebp` 不支持 animated webp（官方提示 `Animated WebP files are not supported`），取帧要用 `webpmux -get frame`。
 
 ### 3.6 交互（M3）
 
 - 拖拽移动、四角 resize、滚轮缩放（Vetta：`pet-widget-bounds.ts`、`resizePetVideoByWheel`）
 - 右键菜单：动作切换 / 置顶开关 / 退出
-- 位置与大小持久化：daemon 侧 JSON 配置文件（`~/Library/Application Support/pet-daemon/config.json`）
+- 位置与大小持久化：daemon 侧 JSON 配置文件（**`~/.litepet/config.json`**，家目录约定见 `docs/PET-PACK.md` §2）
 
 ### 3.7 气泡（M5 打磨项）
 
 - 数据驱动换肤：Vetta 的气泡样式是 JSON（`apps/desktop/src/shared/pet-bubble-styles/*.json`，`surface` 用 Tailwind 类名 + `decor.corners` 四角 PNG）。MVP 先做 plain 样式，换肤 JSON 格式照搬，节日皮肤后续加
 - 气泡位置：默认在宠物上方；宠物贴屏幕顶边时翻到下方（Vetta `bubblePlacement` 逻辑）
+
+### 3.8 宠物包与可扩展性
+
+动作词表、素材布局、行为规则全部由**宠物包 manifest** 声明，不在代码里写死。完整契约见 **`docs/PET-PACK.md`**（v0.2，采用 **Codex 包格式**；§2 目录约定、§3 规格已定稿，§5 图集单格尺寸、§4.4 降级映射待定）。本节只列要点。
+
+三层模型：
+
+| 层 | 含义 | v1 |
+|---|---|---|
+| L1 换美术 | 换掉整套素材，动作集合不变 | ✅ |
+| L2 加动作 | manifest 声明任意动作 id，不限词表 | ✅ |
+| L3 改行为 | 声明「什么事件 → 播什么」，Rust 侧只做通用解释器 | ✅ |
+
+L3 是唯一能把 §3.4 「策略逻辑要手写 Rust」这条成本压下去的办法：把 Vetta `session-event-action-policy.ts`（315 行）那类逻辑变成 manifest 里的规则表。
+
+**硬性要求：加载期校验，声明了但不可达的动作 id 必须拒绝加载。**
+
+依据：PetPal Desktop 的格式允许任意动作名，但运行时只播硬编码子集——演示包声明了 `sit: [9,12]`、目录里有 `actions/look_right/`，而在 `src/main.js` 里按名统计 `sit`、`look` 各为 **0 次命中**，永远不会被触发；`anchor`、`sounds`、`portrait` 同样 0 次命中，`personality.catchphrases` 只写不读。**死 schema 比直接不支持更糟**，因为用户会以为能用。详见 `docs/PET-PACK.md` §0.1。
 
 ## 4. 组件 B：pi 扩展适配器
 
@@ -234,20 +293,30 @@ export default function (pi: ExtensionAPI) {
 | `apps/desktop/src/shared/pet-actions.ts` | 动作数据模型与清单 |
 | `apps/desktop/src/shared/pet-bubble-styles/*.json` | 气泡换肤 JSON 格式（M5） |
 | `apps/desktop/src/renderer/domains/pet/` | React 前端参考：`PetApp.tsx`（状态编排）、`PetVideoSurface.tsx`、`PetSpeechBubble.tsx`、`usePetBubble.ts`、`usePetPresentationThrottle.ts` |
-| `apps/desktop/build/pet/*.webm` | 8 个白鼬透明视频素材（见 §7 许可） |
+| `apps/desktop/build/pet/*.webm` | 8 个白鼬透明视频素材（见 §7 许可）；**需转码为 animated WebP 才能用**（§3.5） |
 
 ## 7. 素材与许可
 
-- Open Vetta 仓库整体 **Apache-2.0**。白鼬 webm 位于 `apps/desktop/build/pet/`，属于仓库内容，按 Apache-2.0 可复用
+**两套素材并存，用途不同**（均在本仓库）：
+
+| 目录 | 内容 | 体积 | 用途 |
+|---|---|---|---|
+| `assets/pet/` | 8 个 `.webm`（VP9+alpha，302 帧 / 10.066s / 30fps / 576×576） | 5.0 MB | **仅作再生成源**，不参与运行、不打包 |
+| `assets/pet-440/` | 8 个 animated `.webp`（440px/12fps/q80） | 12 MB | **运行用**，`<img>` 直接播放 |
+
+已逐项验过 `assets/pet-440/*.webp` 均为 `Alpha: 1, Animation: 1`。
+
+- 素材来源：Open Vetta 仓库（Apache-2.0），原始 webm 位于 `apps/desktop/build/pet/`
 - **必须**：在 pet-daemon 项目中保留 Apache-2.0 要求的版权与许可声明；动手前核对 `/Users/eee/tools/open-vetta/NOTICE` 中是否有针对这批素材的额外归属说明（若 NOTICE 把素材列为第三方，则按 NOTICE 归属，不可直接搬）
-- 素材拷贝到 pet-daemon 的 `assets/pet/` 目录，动作文件名即动作 id（§3.4 表）
+- **动作 id 由宠物包 manifest 声明，不得从文件名推断**（§3.8 / `docs/PET-PACK.md` §4）。内置包恰好满足「文件名 = 动作 id」，但外部包允许文件名任意，否则用户无法用自己命名的素材
+- ⚠️ **转码脚本缺失，素材当前不可复现**：`assets/pet-440/` 是早期在 `/tmp` 里一次性用 `img2webp` 生成的，`scripts/` 目录**为空**，仓库内无任何转码代码。M1 动手前必须补 `scripts/transcode-pet-assets.sh`（工具链见 §3.5）
 
 ## 8. 里程碑与验收
 
 | 里程碑 | 内容 | 验收标准 |
 |---|---|---|
 | M0 | 仓库初始化 + 本文档入库 + 协议 v1 定稿 | `docs/PROTOCOL.md` 与本文 §2 一致；CI（fmt/clippy/build）跑通 |
-| M1 | Tauri daemon：透明窗 + webm 播放 + socket server + 状态机最小版 | `echo '{"v":1,"type":"agent.start","host":"test"}' \| socat - UNIX-CONNECT:<sock>` 后宠物切打字动画；`agent.end` 后举杠铃；socat 断开 linger 30s 后退出；二次启动检测单例 |
+| M1 | Tauri daemon：透明窗 + animated WebP 播放 + socket server + 状态机最小版 | `echo '{"v":1,"type":"agent.start","host":"test"}' \| socat - UNIX-CONNECT:<sock>` 后宠物切打字动画；`agent.end` 后举杠铃；socat 断开 linger 30s 后退出；二次启动检测单例 |
 | M2 | pi 适配器 | pi 里跑一次真实任务：agent 起时打字、结束举杠铃、工具调用出气泡；pi 退出后 daemon 注销该宿主；`/pet` 命令可用 |
 | M3 | 点击穿透 + 拖拽/缩放/右键菜单 + 位置持久化 | 宠物不挡下层点击；点中宠物可拖可缩；重启后位置保留 |
 | M4 | dsh 适配器 | 与 M2 同标准在 dsh 上验收；pi+dsh 同时跑时仲裁与徽章正确 |
@@ -263,6 +332,8 @@ export default function (pi: ExtensionAPI) {
 2. Vetta 桌宠全部实现细节与文件路径（§3、§6 所列，均出自源码勘察）
 3. dsh 的定位、Cordis 架构、out-of-tree bundle 生态（官方仓库与文档）
 4. Open Vetta 仓库 Apache-2.0
+5. **animated WebP 在 WKWebView 下 alpha 正常**，VP9+alpha 的 webm 在 WKWebView 下完全不透明（§3.5，本机 Swift + WKWebView 像素级实测，含 PNG 对照组）
+6. 三家同类实现的扩展性边界（codex-pet-desktop / PiDeck / PetPal Desktop 的扩展能力与死 schema 清单，`docs/PET-PACK.md` §0.1）
 
 **⚠️ 待执行时核实（先查证再写码，查不到就按保守方案并标注）**：
 
@@ -272,6 +343,7 @@ export default function (pi: ExtensionAPI) {
 4. Tauri 生态的系统睡眠/唤醒监听方案
 5. `apps/desktop/build/pet/*.webm` 素材在 NOTICE 中有无特殊归属（§7）
 6. Vetta 各动作的精确 autoDuration（§3.4 表以源码为准）
+7. **目标机型上的 animated WebP 透明需复测**：本机 macOS 上验证通过，但 `PaperMC/fill-ui#14` 有 2025-11-14 在 macOS Safari 26.2 上的最小复现结论为「Safari macOS does not support webp transparency」，与本机实测**相反**。可能这一年修了，也可能编码参数不同（本机用 `img2webp -lossy -q 80`，每帧带独立 ALPH chunk）。以实测为准，但发布前按目标机型重测
 
 ## 10. 环境备忘
 

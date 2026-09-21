@@ -110,27 +110,52 @@ idle ──agent.start──► working ──agent.end(success)──► celebr
 - 宿主侧原则：扩展加载时连接 + `host.hello`；宿主进程退出时 socket 自然断开，**无需显式清理**
 - 宿主重连：连接失败按指数退避重试，1s 起，上限 30s；连上后重新 `host.hello`
 
-## 9. 动作组与动作 id
+## 9. 动画名与素材格式
 
-`actions` 组定义见 `SPEC.md` §3.4；动作 id 即 webm 文件名（去掉扩展名）。
+宠物包契约与素材格式的权威定义见 `docs/PET-PACK.md`（依据 Codex 官方源码核实）。本节只讲协议层关心的部分。
 
-| 组 | 默认动作 id |
+**素材是单张图集**：`spritesheet.webp`（透明 WebP），配 `pet.json` 里的网格与动画表。**不是 webm** —— VP9+alpha 的 webm 在 WKWebView 下完全不透明（实测依据见 `SPEC.md` §3.5）。
+
+**动画名由 `pet.json` 的 `animations` 显式声明，不得从文件名或行号推断**：
+
+- `animations` 是**具名 map**，键名任意，且允许 `custom:` 前缀扩展
+- 每个动画用 `frames: Vec<usize>` 声明**精灵索引**（`row * columns + column`），**不是「帧数」**；帧可不连续、可跨行复用
+- 网格（单格尺寸 / 列数 / 行数）由 `frame` 字段自定义，默认 `192×208` / 8 列 / 9 行，**没有「必须 1536×1872」的校验**
+- 是否循环看 `loop_start`：`Some(i)` 从第 `i` 帧起循环（**不是从 0**）；`None` 表示一次性，播完交棒 `fallback`
+
+所以内置包与外部包在 daemon 眼里**完全同构**：都是「一个动画名 → 一串带时长的精灵索引」。
+
+### 9.1 动作组
+
+组是**我们**的概念（Codex 格式里没有），定义在 `petdaemon.behavior.groups`（契约见 `docs/PET-PACK.md` §4.2）。组的语义与 `SPEC.md` §3.4 一致，组内多个动画按轮换规则选用。
+
+### 9.2 内置包
+
+下表为**内置包**的动画名（示例数据，**非固定词表**；外部包的动画名由自己的 `pet.json` 决定）：
+
+| 组 | 内置默认动画名 |
 |---|---|
 | `idle` | `stoat_spin_color_hula_hoop` |
 | `working` | `stoat_work_laptop_typing_desk_cushion` |
-| `resting` | `stoat_sit_cushion_drink_tea_slow` |
-| `feedback` | `stoat_stand_lift_barbell_one_hand_fast` |
+| `resting` | `stoat_sit_cushion_drink_tea_slow`、`stoat_sleep_lie_on_cushion`、`stoat_listen_music_headphones_nod`、`stoat_skip_rope_jump` |
+| `feedback` | `stoat_stand_lift_barbell_one_hand_fast`、`stoat_wave_backflip_smoke_fade_exit` |
 
-事件 → 动作映射：
+内置包恰好满足「动画名 = 素材文件名」，但这是**巧合，不是契约**——外部包的文件名与动画名可以完全无关，否则用户无法用自己命名的素材。
 
-| 事件 | 动作 | 气泡 |
+### 9.3 事件 → 动画映射
+
+| 事件 | 播放 | 气泡 |
 |---|---|---|
-| `agent.start` | working 默认 | `status`：开始工作 |
+| `agent.start` | `working` 组默认 | `status`：开始工作 |
 | `tool.start` | 保持当前 | `tool`：`{toolName}` 或宿主给的 `bubble` 文本 |
-| `tool.end`(isError) | feedback：`stoat_wave_backflip_smoke_fade_exit` | `error` |
-| `agent.end`(success) | feedback：`stoat_stand_lift_barbell_one_hand_fast` | `success`：任务完成 |
-| `agent.end`(fail) | feedback：`stoat_wave_backflip_smoke_fade_exit` | `info`：任务失败 |
-| 90s 无事件 | resting 组轮换 | — |
+| `tool.end`(isError) | `feedback`：`stoat_wave_backflip_smoke_fade_exit` | `error` |
+| `agent.end`(success) | `feedback`：`stoat_stand_lift_barbell_one_hand_fast` | `success`：任务完成 |
+| `agent.end`(fail) | `feedback`：`stoat_wave_backflip_smoke_fade_exit` | `info`：任务失败 |
+| 90s 无事件 | `resting` 组轮换 | — |
+
+> 上表是**内置包** `pet.json` 里 `petdaemon.behavior.rules` 的等价描述（规则表契约见 `docs/PET-PACK.md` §4.3）。外部包在自己 manifest 里覆盖；daemon 侧只做**通用规则解释器**，不把这套映射写死在 Rust 代码里。
+>
+> 纯 Codex 包（无 `petdaemon` 键）走 `docs/PET-PACK.md` §4.4 的降级映射表。
 
 ## 10. 手工验证
 
