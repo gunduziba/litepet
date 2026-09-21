@@ -724,6 +724,11 @@ fn main() {
     let bound_port = Arc::new(AtomicU16::new(0));
     let port_shared = Arc::clone(&bound_port);
     let app = tauri::Builder::default()
+        // 通知插件必须注册。`alert::desktop` 用的是 `app.notification()`，那个 API
+        // 一开口就先取插件状态——没注册就 panic。此前它**从未被注册**，于是设置页一点
+        // 「测试提醒」就 panic；而 panic 抛在 Tauri IPC 线程上会跨 FFI 边界，直接把
+        // 整个进程带走，表现就是「程序直接退出」。
+        .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
             let (state, configured_port) = init_pet();
             // 命令行优先于配置文件。
