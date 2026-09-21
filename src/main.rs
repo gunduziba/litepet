@@ -5,32 +5,33 @@
 //! # 线程模型
 //!
 //! ```text
-//! [宿主进程 pi/dsh] --JSONL--> (daemon.rs accept 线程) --mpsc--> (session 线程)
-//!                                                                    |
-//!                                                        DisplayDirective
-//!                                                                    v
-//!                                                   Tauri 事件 "display" → ui/pet.js
+//! [宿主进程 pi/dsh] --HTTP POST /rpc--> (http.rs 工作线程 ×4) --+
+//!                                                          |
+//!                                            Mutex<Session> | 定时空转
+//!                                                          v
+//!                                                 (空转线程, tick)
+//!                                                          |
+//!                                                 DisplayDirective
+//!                                                          v
+//!                                        Tauri 事件 "display" → ui/pet.js
 //! ```
 //!
-//! session 线程是唯一的决策者；Tauri 主线程只跑事件循环与 `pack_info` 命令。
+//! `Session` 是唯一的决策者，被工作线程与空转线程共享；
+//! Tauri 主线程只跑事件循环与几个命令。
 
 mod arbiter;
 mod behavior;
 mod config;
-mod daemon;
+mod http;
+mod jsonrpc;
 mod pack;
 mod protocol;
 mod session;
 
 use anyhow::{Context, Result};
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 use tauri::{Emitter, Manager};
-
-/// daemon 自身版本，随 `host.welcome` 上报。
-const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 渲染层与 session 线程共用的宠物包。
 ///
@@ -84,8 +85,8 @@ fn pick_pack(root: &Path, preferred: Option<&str>) -> Option<String> {
     ids.into_iter().next()
 }
 
-/// 读取配置并加载宠物包。
-fn try_init_pet() -> Result<pack::LoadedPet> {
+/// 读取配置并加载宠物包，顺带把本次启动要用的端口带出来。
+fn try_init_pet() -> Result<(pack::LoadedPet, u16)> {
     let (cfg, created) = config::load_or_init()?;
     if created {
         println!(
@@ -112,44 +113,38 @@ fn try_init_pet() -> Result<pack::LoadedPet> {
         // 纯 Codex 包没有这个键，此时全走 §4.4 降级映射
         None => println!("pet-daemon: 无 petdaemon.behavior 扩展，使用 Codex 降级映射"),
     }
-    Ok(loaded)
+    Ok((loaded, cfg.port))
 }
 
-/// 加载失败只告警，不阻塞窗口启动。
-fn init_pet() -> PetState {
+/// 加载宠物包；失败只告警，不阻塞窗口启动。
+///
+/// 返回的端口在加载失败时没有意义（此时也不会有 HTTP 服务），
+/// 用默认值填上只是让调用方不必处理 `Option`。
+fn init_pet() -> (PetState, u16) {
     match try_init_pet() {
-        Ok(loaded) => PetState(Mutex::new(Some(Arc::new(loaded)))),
+        Ok((loaded, port)) => (PetState(Mutex::new(Some(Arc::new(loaded)))), port),
         Err(err) => {
             eprintln!("pet-daemon: 宠物包加载失败：{err:#}");
-            PetState(Mutex::new(None))
+            (PetState(Mutex::new(None)), config::DEFAULT_PORT)
         }
     }
 }
 
-/// 启动 socket 会话线程。
+/// 启动 HTTP + JSON-RPC 服务。
 ///
-/// 失败只告警：宠物仍应作为「没人说话的桌宠」正常显示。
-fn spawn_session(
-    app: tauri::AppHandle,
-    loaded: &pack::LoadedPet,
-    socket: Option<std::path::PathBuf>,
-    resident: bool,
-) {
-    let behavior = loaded.behavior.clone();
-    let known: BTreeSet<String> = loaded.info.animations.keys().cloned().collect();
-    let socket = match socket.map_or_else(config::socket_path, Ok) {
-        Ok(path) => path,
-        Err(err) => {
-            eprintln!("pet-daemon: 无法定位 socket 路径，socket 服务未启动：{err:#}");
-            return;
-        }
+/// 行为配置非法、生成 token 失败、写对接信息失败都只告警：宠物仍应作为
+/// 「没人说话的桌宠」正常显示。**但端口抢占失败是例外**——那是单例约束，直接退出。
+fn start_http(app: tauri::AppHandle, loaded: &pack::LoadedPet, port: u16, resident: bool) {
+    let setup = session::Setup {
+        pet_id: loaded.info.id.clone(),
+        known: loaded.info.animations.keys().cloned().collect(),
+        petdaemon: loaded.behavior.clone(),
+        resident,
     };
-
-    // 必须 `Session::new` 先于 `Daemon::spawn`：后者会因单例冲突而失败退出。
-    let mut session = match session::Session::new(behavior.as_ref(), known, resident) {
+    let session = match session::Session::new(setup) {
         Ok(session) => session,
         Err(err) => {
-            eprintln!("pet-daemon: 行为配置非法，socket 服务未启动：{err:#}");
+            eprintln!("pet-daemon: 行为配置非法，HTTP 服务未启动：{err:#}");
             return;
         }
     };
@@ -157,55 +152,72 @@ fn spawn_session(
         println!("pet-daemon: 该包无规则表，动画由 Codex 降级映射决定");
     }
 
-    std::thread::spawn(move || {
-        let daemon = match daemon::Daemon::spawn_at(socket, DAEMON_VERSION) {
-            Ok(daemon) => daemon,
-            Err(err) => {
-                eprintln!("pet-daemon: socket 服务启动失败：{err:#}");
-                return;
+    // 先占端口再写对接信息：绑定失败就别留下一个指向死端口的文件。
+    let server = match http::listen(port) {
+        Ok(server) => server,
+        Err(err) => {
+            eprintln!("pet-daemon: {err:#}");
+            // 单例是硬性约束（SPEC §0 约束 2）：没抢到端口就不能再开一只宠物。
+            // 如果只是打条日志就继续跑，结果是一个永远收不到任何事件的僵尸窗口，
+            // 而且它看起来和正常实例一模一样，最难排查。所以这里必须退出。
+            if http::instance_running(port) {
+                println!("pet-daemon: 已有实例在监听 127.0.0.1:{port}，本进程退出（单例）");
+                std::process::exit(0);
             }
-        };
-        println!("pet-daemon: 监听 {}", daemon.socket_path().display());
-
-        loop {
-            let timeout = session.next_deadline(Instant::now());
-            let outcome = match daemon.recv_timeout(timeout) {
-                Ok(Some(msg)) => session.on_msg(msg, Instant::now()),
-                Ok(None) => session.tick(Instant::now()),
-                Err(err) => {
-                    eprintln!("pet-daemon: socket 读取失败：{err:#}");
-                    session::Outcome::Exit
-                }
-            };
-            match outcome {
-                session::Outcome::Display(directive) => {
-                    if let Err(err) = app.emit("display", *directive) {
-                        eprintln!("pet-daemon: 推送渲染层失败：{err}");
-                        break;
-                    }
-                }
-                session::Outcome::Unchanged => {}
-                session::Outcome::Exit => {
-                    app.exit(0);
-                    return;
-                }
-            }
+            eprintln!("pet-daemon: 端口 {port} 上没有任何服务在监听，无法继续");
+            std::process::exit(1);
         }
-        app.exit(0);
+    };
+    let token = match config::random_token() {
+        Ok(token) => token,
+        Err(err) => {
+            eprintln!("pet-daemon: {err:#}");
+            return;
+        }
+    };
+    match config::write_endpoint(protocol::PROTOCOL_VERSION, port, &token) {
+        Ok(path) => println!(
+            "pet-daemon: 监听 http://127.0.0.1:{port}{}（对接信息 {}）",
+            http::RPC_PATH,
+            path.display()
+        ),
+        Err(err) => {
+            eprintln!("pet-daemon: {err:#}");
+            return;
+        }
+    }
+
+    let exit_app = app.clone();
+    let hooks = Arc::new(http::Hooks {
+        display: Box::new(move |directive| {
+            if let Err(err) = app.emit("display", directive) {
+                eprintln!("pet-daemon: 推送渲染层失败：{err}");
+            }
+        }),
+        exit: Box::new(move || {
+            // 正常退出时收拾对接信息；失败只提示，不影响退出。
+            if let Err(err) = config::remove_endpoint() {
+                eprintln!("pet-daemon: {err:#}");
+            }
+            exit_app.exit(0);
+        }),
     });
+
+    // 会话交给工作线程与空转线程共享，主线程不再碰它。
+    http::serve(server, Arc::new(Mutex::new(session)), token, hooks);
 }
 
-/// 解析命令行：目前只有 `--resident`。
-fn parse_args() -> (bool, Option<std::path::PathBuf>) {
+/// 解析命令行：`--resident` 与 `--port`。
+fn parse_args() -> (bool, Option<u16>) {
     let mut resident = false;
-    let mut socket = None;
+    let mut port = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--resident" => resident = true,
-            "--socket" => socket = args.next().map(std::path::PathBuf::from),
+            "--port" => port = args.next().and_then(|raw| raw.parse().ok()),
             "--help" | "-h" => {
-                println!("pet-daemon [--resident] [--socket <path>]");
+                println!("pet-daemon [--resident] [--port <端口>]");
                 std::process::exit(0);
             }
             other => {
@@ -214,17 +226,17 @@ fn parse_args() -> (bool, Option<std::path::PathBuf>) {
             }
         }
     }
-    (resident, socket)
+    (resident, port)
 }
 
 fn main() {
-    let (resident, mut socket) = parse_args();
+    let (resident, port) = parse_args();
     if resident {
         println!("pet-daemon: 常驻模式，全部宿主断开后不退出");
     }
     tauri::Builder::default()
         .setup(move |app| {
-            let state = init_pet();
+            let (state, configured_port) = init_pet();
             let loaded = state
                 .0
                 .lock()
@@ -232,7 +244,9 @@ fn main() {
                 .and_then(|guard| guard.as_ref().map(Arc::clone));
             app.manage(state);
             if let Some(loaded) = loaded {
-                spawn_session(app.handle().clone(), &loaded, socket.take(), resident);
+                // 命令行优先于配置文件。
+                let port = port.unwrap_or(configured_port);
+                start_http(app.handle().clone(), &loaded, port, resident);
             }
             Ok(())
         })

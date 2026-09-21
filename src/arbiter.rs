@@ -90,7 +90,14 @@ struct HostEntry {
     /// 反馈状态何时结束。
     feedback_until: Option<Instant>,
     /// 最近一次收到该宿主任何帧的时刻。
+    /// 最近一次收到该宿主**真实活动**的时刻（不影响存活判定）。
     last_event: Instant,
+    /// 最近一次收到该宿主**任何**消息（含心跳）的时刻，只用于回收死宿主。
+    ///
+    /// 与 `last_event` 分开的理由：心跳不算「干活」，如果心跳也刷新 `last_event`，
+    /// 那么只要宿主定期 ping，`idle_for` 就永远不会超过 `idleTimeoutMs`，
+    /// 宠物便再也进不了 `resting`。
+    last_seen: Instant,
     /// 规则表显式指定的播放目标。
     override_play: Option<Override>,
     /// 当前气泡。
@@ -136,6 +143,7 @@ impl Arbiter {
                 stage: HostStage::Idle,
                 feedback_until: None,
                 last_event: now,
+                last_seen: now,
                 override_play: None,
                 bubble: None,
             },
@@ -258,11 +266,32 @@ impl Arbiter {
         self.set_bubble(host, kind, text, ttl, None, now);
     }
 
-    /// `ping`：只刷新存活时间，不产生任何显示变化。
-    pub fn on_ping(&mut self, host: &str, now: Instant) {
+    /// 刷新存活时间：每条来自该宿主的消息（含心跳）都该调一次。
+    ///
+    /// 只影响「宿主是否还活着」，不产生任何显示变化：
+    /// `resting` 判定看的是 `last_event`，心跳不会把睡着的宠物叫醒。
+    pub fn touch(&mut self, host: &str, now: Instant) {
         if let Some(entry) = self.hosts.get_mut(host) {
-            entry.last_event = now;
+            entry.last_seen = now;
         }
+    }
+
+    /// 注销超时未联系的宿主，返回被注销的宿主名。
+    ///
+    /// HTTP 是无连接的：宿主崩掉时不会有机会发 `host/bye`，而「宿主还在」是
+    /// linger 倒计时的前提。没有这个兜底，宠物会永远赖在屏幕上不退出
+    /// （`docs/PROTOCOL.md` §7）。未登记的宿主不受影响。
+    pub fn reap_dead(&mut self, now: Instant, timeout: Duration) -> Vec<String> {
+        let dead: Vec<String> = self
+            .hosts
+            .iter()
+            .filter(|(_, entry)| now.saturating_duration_since(entry.last_seen) >= timeout)
+            .map(|(host, _)| host.clone())
+            .collect();
+        for host in &dead {
+            self.hosts.remove(host);
+        }
+        dead
     }
 
     /// 规则表给出的显式播放目标；`expires_at` 为 `None` 表示持续到下次状态变迁。
@@ -786,5 +815,64 @@ mod tests {
         // 纯 Codex 包且缺 idle：不能返回空动画名给渲染层。
         let behavior = Behavior::new(None, &only_sad).expect("应降级成功");
         assert_eq!(arbiter.directive(now, &behavior, &only_sad).animation, "sad");
+    }
+
+    /// 心跳必须不能把睡着的宠物叫醒：`touch` 只动 `last_seen`。
+    #[test]
+    fn touch_does_not_postpone_resting() {
+        let now = Instant::now();
+        let mut arbiter = arbiter_with("pi", now);
+        let behavior = behavior();
+        let known = known();
+
+        // 模拟「宿主一直在线、但一直没干活」：每 20s 一次心跳，持续 2 分钟。
+        let mut at = now;
+        while at < now + Duration::from_secs(120) {
+            at += Duration::from_secs(20);
+            arbiter.touch("pi", at);
+        }
+
+        // idleTimeoutMs = 90s，心跳不该阻止进入 resting。
+        assert_eq!(arbiter.directive(at, &behavior, &known).animation, "rest_tea");
+    }
+
+    #[test]
+    fn touch_keeps_host_alive() {
+        let now = Instant::now();
+        let mut arbiter = arbiter_with("pi", now);
+        let timeout = Duration::from_secs(60);
+        let at = now + Duration::from_secs(45);
+        arbiter.touch("pi", at);
+        assert!(arbiter.reap_dead(at + Duration::from_secs(10), timeout).is_empty());
+        assert_eq!(arbiter.host_count(), 1);
+    }
+
+    #[test]
+    fn silent_host_is_reaped() {
+        let now = Instant::now();
+        let mut arbiter = arbiter_with("pi", now);
+        arbiter.register("dsh", now);
+        let timeout = Duration::from_secs(60);
+
+        // dsh 在 30s 时还说了一句话，pi 一直沉默。
+        arbiter.touch("dsh", now + Duration::from_secs(30));
+        let dead = arbiter.reap_dead(now + Duration::from_secs(61), timeout);
+
+        assert_eq!(dead, vec!["pi".to_string()]);
+        assert!(!arbiter.is_registered("pi"));
+        assert!(arbiter.is_registered("dsh"));
+    }
+
+    #[test]
+    fn reaping_an_unknown_host_is_a_no_op() {
+        let now = Instant::now();
+        let mut arbiter = arbiter_with("pi", now);
+        // 未登记的宿主不会被 touch 登记，也就没有条目可回收。
+        arbiter.touch("ghost", now);
+        // 超时给得远大于已过时间，让 pi 一定活下来：
+        // 这样 `dead` 非空就只能是 ghost 被算进去了。
+        let dead = arbiter.reap_dead(now + Duration::from_secs(600), Duration::from_secs(6_000));
+        assert!(dead.is_empty(), "只应回收已登记的宿主，实际回收了 {dead:?}");
+        assert_eq!(arbiter.host_count(), 1);
     }
 }

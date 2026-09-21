@@ -19,17 +19,17 @@
 
 **硬性设计约束**（不可妥协）：
 
-1. 协议中立：桌宠进程不 import 任何宿主（pi/dsh）的代码，只认一份 JSONL 协议
-2. daemon 单例：多个宿主连接同一个 daemon，而不是各开一只宠物
-3. 宿主退出即注销：宿主进程死 → 连接断 → 宠物知道，不许留僵尸状态
+1. 协议中立：桌宠进程不 import 任何宿主（pi/dsh）的代码，只认一份 JSON-RPC 2.0 协议
+2. daemon 单例：多个宿主打同一个 daemon，而不是各开一只宠物
+3. 宿主退出即注销：宿主发 `host/bye` 立即注销；进程崩溃则靠心跳超时（60s）回收，不许留僵尸状态
 4. 桌宠进程不是沙箱：与 Open Vetta 桌宠同等信任级（本机自用工具，不做安全隔离）
 
 ## 1. 架构总览
 
 ```text
 ┌─ pi TUI ───────────────┐                          ┌─ pet-daemon（Tauri App）─────────────┐
-│ ~/.pi/agent/extensions/ │   Unix domain socket     │ Rust 侧：                            │
-│ pet.ts                  │ ─────┐                   │  - JSONL socket server（多客户端）   │
+│ ~/.pi/agent/extensions/ │  HTTP + JSON-RPC 2.0     │ Rust 侧：                            │
+│ pet.ts                  │ ─────┐                   │  - HTTP server（回环 + Bearer 鉴权） │
 │  pi.on(...) 事件适配     │      │    协议 v1         │  - 宿主注册表 + 心跳 + 仲裁          │
 └─────────────────────────┘      ├─────────────────► │  - 光标轮询 + 点击穿透（照搬 Vetta） │
 ┌─ dsh ───────────────────┐      │                   │ 前端(WebView)：                       │
@@ -49,33 +49,41 @@
 
 ## 2. 协议规范 v1（先定稿再写码）
 
-**传输**：Unix domain socket。路径**统一为 `~/.litepet/daemon.sock`**：与 `config.json`／`pets/` 同处家目录，受 `LITEPET_HOME` 控制；路径长度远低于 macOS 的 104 字节 `sun_path` 上限，且不受 `$TMPDIR` 清理影响。Windows 走命名管道 `\\.\pipe\pet-daemon`（M5 再做）。
+**传输**：HTTP/1.1 over **回环地址**，报文为 **JSON-RPC 2.0**。`POST http://127.0.0.1:<port>/rpc`，`Authorization: Bearer <token>`。只绑回环，绝不出现在局域网上。
 
-**帧**：JSONL，`\n` 分隔，UTF-8。socket 文件被占用即视为 daemon 已运行（天然单例锁）。
+**端点发现**：daemon 绑定成功后写出 `~/.litepet/daemon.json`（权限 `0600`，与 `config.json`／`pets/` 同处家目录，受 `LITEPET_HOME` 控制），内容是 `{"protocolVersion": 1, "port": <端口>, "token": "<32 位十六进制>"}`，退出时删除。宿主每次启动重新读它，不缓存。
 
-> **协议性质**：这不是纯 RPC。`host.hello`/`ping` 是请求-应答模式；**其余全部是单向事件通知，daemon 不回包，宿主不得阻塞等待响应**。宿主死活检测依赖连接断开与心跳超时，而非调用超时。实现时严禁把 `agent.start`/`tool.start` 等做成同步等待回包的 RPC 调用。
+**单例锁**：端口被占用即视为已有实例在跑，新进程直接退出。bind 是原子的，比旧的 socket 文件探测更可靠。
 
-**消息通用信封**：`{ "v": 1, "type": "<类型>", "host": "<pi|dsh|其他>", ... }`
+> **为什么不用 Unix socket**（M0–M1 曾用 socket + JSONL）：宿主侧零依赖（`fetch` 即可），没有「连接」这层状态——不存在半开连接与 EOF/ECONNRESET 区分，宿主崩溃天然无副作用，也不需要指数退避重连；并且可以直接用 `curl` 手工验证。代价是每个事件一次回环往返（几十微秒），且 daemon 不能主动推消息（只能应答）。
+
+> **协议性质**：这不是纯 RPC，而是「单向事件流 + 少量查询」。只有 `host/hello`、`daemon/ping`、`daemon/info` 是请求-应答；**其余全部是通知（不带 `id`），daemon 只回 HTTP 204，宿主不得等待响应**。宿主死活检测靠心跳超时与显式 `host/bye`，而非连接断开。实现时严禁把 `agent/start`/`tool/start` 等做成同步等待回包的调用。
+
+**消息信封**：标准 JSON-RPC 2.0——`{ "jsonrpc": "2.0", "method": "<名字>", "params": {...}, "id": <有则是请求> }`。未知 `method` 出现在通知里必须静默忽略（前向兼容），出现在请求里回 `-32601`。自定义错误码：`-32001` 宿主未注册、`-32002` 协议版本过高。
 
 ### 2.1 宿主 → daemon
 
-| type | 字段 | 语义 |
+| method | 参数 | 语义 |
 |---|---|---|
-| `host.hello` | `pid`, `agentVersion`, `clientVersion` | 注册宿主；daemon 回 `host.welcome` |
-| `agent.start` | `sessionId?`, `summary?` | 该宿主的 agent 开始干活 |
-| `agent.end` | `sessionId?`, `success: bool` | 该宿主的 agent 结束 |
-| `tool.start` | `toolName`, `bubble?` | 工具开始；`bubble` 可选文本（建议 ≤48 字符，超长由 daemon 截断） |
-| `tool.end` | `toolName` | 工具结束 |
-| `bubble` | `kind: "status"\|"success"\|"info"`, `text`, `ttlMs?` | 直接发一条气泡 |
-| `ping` | `ts` | 心跳 |
+| `host/hello` | `protocolVersion`, `pid?`, `agentVersion?`, `clientVersion?` | 注册宿主（**请求**）；daemon 应答 `{daemonVersion, petId, protocolVersion}` |
+| `host/bye` | `reason?` | 主动注销，立即生效不等超时 |
+| `agent/start` | `sessionId?`, `summary?` | 该宿主的 agent 开始干活 |
+| `agent/end` | `sessionId?`, `success: bool` | 该宿主的 agent 结束 |
+| `tool/start` | `toolName`, `bubble?` | 工具开始；`bubble` 可选文本（建议 ≤48 字符，超长由 daemon 截断） |
+| `tool/end` | `toolName`, `isError?` | 工具结束 |
+| `pet/bubble` | `kind: "info"\|"status"\|"tool"\|"success"\|"warning"\|"error"`, `text`, `ttlMs?` | 直接发一条气泡 |
+| `daemon/ping` | `ts` | 心跳（**请求**），应答原样回显 `ts` |
+| `daemon/info` | — | 查 daemon 现状（**请求**，调试与适配器自检用） |
 
 ### 2.2 daemon → 宿主
 
-| type | 字段 | 语义 |
+只应答请求，**没有主动推送**（`host.welcome`／`pong`／`host.evicted` 三种旧推送报文已废弃）。
+
+| method | `result` 字段 | 语义 |
 |---|---|---|
-| `host.welcome` | `daemonVersion`, `assignedHost` | 注册确认 |
-| `pong` | `ts` | 心跳回应 |
-| `host.evicted` | `reason` | 该宿主被强制注销（如协议版本不兼容） |
+| `host/hello` | `daemonVersion`, `petId`, `protocolVersion` | 注册确认 |
+| `daemon/ping` | `host`, `protocolVersion`, `ts` | 心跳回应 |
+| `daemon/info` | `daemonVersion`, `protocolVersion`, `petId`, `resident`, `hostCount`, `pingIntervalMs`, `hostTimeoutMs` | daemon 现状 |
 
 ### 2.3 仲裁规则（M1 实现最小版，M3 打磨）
 
@@ -83,13 +91,13 @@
 - 显示优先级：最近一次事件的宿主优先（last-event-wins）
 - 聚合降级：若两个宿主都 working，宠物保持「打字」动画，气泡轮换显示最近工具调用，气泡文本带宿主徽章前缀（`[pi]` / `[dsh]`）
 - 气泡规则（照搬 Vetta）：`ttlMs` 默认 4s；`dedupeKey`（tool.start 气泡用 toolName 做去重键，避免连发）；正文截断 48 字符、详情截断 120 字符
-- 心跳：宿主每 5s 一 ping，3 次未收到判死并注销该宿主；连接断开立即注销
+- 心跳：宿主每 20s 一 ping，60s（3 次）未收到判死并注销；收到 `host/bye` 立即注销
 
 ### 2.4 生命周期
 
-- daemon 启动即创建 socket；若已存在且能 `ping` 通，直接退出（单例）
-- 所有宿主连接断开 → linger 30 秒（可配 `--resident` 常驻）→ 退出
-- 宿主侧原则：扩展加载时连接 + 注册，宿主退出时进程死、socket 自然断，无需显式清理
+- daemon 启动即绑回环端口；端口被占用直接退出（单例）；绑定成功后写 `daemon.json`，退出时删除
+- 所有宿主注销 → linger 30 秒（可配 `--resident` 常驻）→ 退出
+- 宿主侧原则：进程启动时读 `daemon.json` + `host/hello`；退出时尽量发一条 `host/bye`，不发也只是等 60s 心跳超时
 
 ## 3. 组件 A：pet-daemon（Tauri）
 
@@ -245,26 +253,30 @@ L3 是唯一能把 §3.4 「策略逻辑要手写 Rust」这条成本压下去�
 **✅ 已核实**（源：pi 扩展文档 `extensions.md`）：
 
 - 扩展位置：`~/.pi/agent/extensions/pet.ts`（全局自动发现，支持 `/reload` 热重载）
-- 扩展是普通 TS 模块，拥有完整系统权限：可直接 `import { net } from "node:net"`、`node:child_process`
+- 扩展是普通 TS 模块，拥有完整系统权限：可直接 `import { readFile } from "node:fs"`、`node:child_process`
+- **宿主侧零依赖**：HTTP 客户端用内置 `fetch`，不需要 socket 库
 - 可用事件（本适配器需要的全部）：
-  - `pi.on("session_start")` → 连接 daemon + `host.hello`
-  - `pi.on("session_shutdown")` → 关闭连接
-  - `pi.on("agent_start")` → `agent.start`
-  - `pi.on("agent_end")` → `agent.end`
-  - `pi.on("tool_execution_start")` → `tool.start`（事件里取工具名）
-  - `pi.on("tool_execution_end")` → `tool.end`
+  - `pi.on("session_start")` → 读 `daemon.json` + `host/hello`
+  - `pi.on("session_shutdown")` → `host/bye`
+  - `pi.on("agent_start")` → `agent/start`
+  - `pi.on("agent_end")` → `agent/end`
+  - `pi.on("tool_execution_start")` → `tool/start`（事件里取工具名）
+  - `pi.on("tool_execution_end")` → `tool/end`
   - 事件详细 payload 结构写码前读 `docs/extensions.md` 的 Events 章节核对
 - `pi.registerCommand()` 注册 `/pet` 命令（开关/查看连接状态）
-- 心跳：`setInterval` 5s 发 ping，连接断开时指数退避重连（1s 起，上限 30s）
+- 心跳：`setInterval` 20s 发 `daemon/ping`。**无需重连逻辑**——HTTP 上没有连接可断，每个事件都是独立请求，daemon 挂了就等它重启后重新 `host/hello`
 
 骨架（可直接用）：
 
 ```ts
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createConnection } from "node:net";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 export default function (pi: ExtensionAPI) {
-  // 状态：连接句柄 + 重连定时器；实现 host.hello / 事件转发 / ping / 重连
+  // 状态：端点（{port, token}）+ 心跳定时器
+  // 实现：读 ~/.litepet/daemon.json → host/hello → 事件转发 → 20s daemon/ping
   // 细节按本节上文规则补全
 }
 ```
@@ -316,7 +328,7 @@ export default function (pi: ExtensionAPI) {
 | 里程碑 | 内容 | 验收标准 |
 |---|---|---|
 | M0 | 仓库初始化 + 本文档入库 + 协议 v1 定稿 | `docs/PROTOCOL.md` 与本文 §2 一致；CI（fmt/clippy/build）跑通 |
-| M1 | Tauri daemon：透明窗 + animated WebP 播放 + socket server + 状态机最小版 | `echo '{"v":1,"type":"agent.start","host":"test"}' \| socat - UNIX-CONNECT:<sock>` 后宠物切打字动画；`agent.end` 后举杠铃；socat 断开 linger 30s 后退出；二次启动检测单例 |
+| M1 | Tauri daemon：透明窗 + animated WebP 播放 + HTTP server + 状态机最小版 | `node scripts/host-sim.mjs` 演完整会话：宠物切打字动画 → 出气泡 → `agent/end` 后举杠铃 → 道别后 linger 30s 退出并删掉 `daemon.json`；二次启动检测单例 |
 | M2 | pi 适配器 | pi 里跑一次真实任务：agent 起时打字、结束举杠铃、工具调用出气泡；pi 退出后 daemon 注销该宿主；`/pet` 命令可用 |
 | M3 | 点击穿透 + 拖拽/缩放/右键菜单 + 位置持久化 | 宠物不挡下层点击；点中宠物可拖可缩；重启后位置保留 |
 | M4 | dsh 适配器 | 与 M2 同标准在 dsh 上验收；pi+dsh 同时跑时仲裁与徽章正确 |

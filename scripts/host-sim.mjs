@@ -1,28 +1,46 @@
 #!/usr/bin/env node
 // 宿主模拟器：按 docs/PROTOCOL.md 演一遍完整会话，用来验证 daemon 侧行为。
 //
+// 它扮演一个真实宿主：读 ~/.litepet/daemon.json 拿到端口与 token，
+// 然后往 http://127.0.0.1:<port>/rpc 发 JSON-RPC 2.0 请求。
+//
 // 用法：
-//   node scripts/host-sim.mjs                       # 默认 socket、宿主名 pi
+//   node scripts/host-sim.mjs                      # 宿主名 pi，每步间隔 1.5s
 //   node scripts/host-sim.mjs --host dsh
-//   node scripts/host-sim.mjs --socket /tmp/x.sock --step 800
+//   node scripts/host-sim.mjs --step 0             # 一口气跑完
+//   node scripts/host-sim.mjs --keep-alive         # 演完不退出，持续心跳
 //
 // 它不只是「发完就退」：每步之间留出间隔，好让人眼确认宠物真的动了。
 
-import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 /** 协议版本，与 src/protocol.rs 的 PROTOCOL_VERSION 保持一致。 */
 const PROTOCOL_VERSION = 1;
-/** 默认心跳间隔（ms），协议 §7 要求宿主每 5s 一次 ping。 */
+/** 每步之间的默认间隔（ms）。 */
 const DEFAULT_STEP_MS = 1500;
 /** 默认宿主标识。 */
 const DEFAULT_HOST = 'pi';
-/** 等 socket 出现的轮询间隔（ms）。 */
+/** 心跳间隔（ms），协议建议 20s，模拟器用 5s 方便观察。 */
+const PING_MS = 5000;
+/** 等 daemon.json 出现的轮询间隔（ms）。 */
 const POLL_MS = 100;
-/** 等 socket 出现的超时（ms）。 */
+/** 等 daemon.json 出现的默认超时（ms）。 */
 const DEFAULT_WAIT_MS = 20_000;
+
+/** 协议里的方法名（与 src/protocol.rs 的 method 模块一致）。 */
+const METHOD = {
+  hostHello: 'host/hello',
+  hostBye: 'host/bye',
+  agentStart: 'agent/start',
+  agentEnd: 'agent/end',
+  toolStart: 'tool/start',
+  toolEnd: 'tool/end',
+  petBubble: 'pet/bubble',
+  daemonPing: 'daemon/ping',
+  daemonInfo: 'daemon/info',
+};
 
 /** 解析 `--key value` 形式的参数。 */
 function parseArgs(argv) {
@@ -39,133 +57,191 @@ function parseArgs(argv) {
   return out;
 }
 
-/** 默认 socket 路径，与 src/config.rs 的 socket_path() 一致。 */
-function defaultSocket() {
-  const home = process.env.LITEPET_HOME || path.join(os.homedir(), '.litepet');
-  return path.join(home, 'daemon.sock');
+/** 家目录，与 src/config.rs 的 home_dir() 一致。 */
+function homeDir() {
+  return process.env.LITEPET_HOME || path.join(os.homedir(), '.litepet');
 }
 
-/** 造一帧：自动补齐 `v` / `type` / `host`。 */
-function frame(host, type, payload = {}) {
-  return `${JSON.stringify({ v: PROTOCOL_VERSION, type, host, ...payload })}\n`;
+/** 对接信息文件路径，与 src/config.rs 的 endpoint_path() 一致。 */
+function endpointPath() {
+  return path.join(homeDir(), 'daemon.json');
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** 等 socket 文件出现。
+/** 等 daemon.json 出现并读出内容。
  *
  * daemon 冷启动（Tauri 窗口 + 图集解析）可能要好几秒，固定 sleep 会随机失败。
+ * 文件由 daemon 在「端口已绑定」之后才写，所以它出现就意味着可以连了。
  */
-async function waitForSocket(socket, timeoutMs) {
+async function waitForEndpoint(file, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
+  let lastError = '文件尚未出现';
   while (Date.now() < deadline) {
-    if (fs.existsSync(socket)) return true;
+    try {
+      const raw = fs.readFileSync(file, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (parsed.port && parsed.token) return parsed;
+      lastError = '文件里缺 port 或 token';
+    } catch (err) {
+      lastError = err.message;
+    }
     await sleep(POLL_MS);
   }
-  return false;
+  throw new Error(`等待 ${timeoutMs}ms 后仍读不到对接信息：${file}（${lastError}）`);
+}
+
+/** 一个 JSON-RPC 2.0 客户端。 */
+class RpcClient {
+  /** @param {string} url 端点地址 @param {string} token 访问密钥 */
+  constructor(url, token) {
+    this.url = url;
+    this.token = token;
+    /** 请求 id 计数器。 */
+    this.nextId = 1;
+  }
+
+  /** 发一次调用；`notification` 为真时不带 id。 */
+  async call(method, params = {}, { notification = false } = {}) {
+    const body = { jsonrpc: '2.0', method, params };
+    if (!notification) {
+      body.id = this.nextId;
+      this.nextId += 1;
+    }
+    const response = await fetch(this.url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    let parsed = null;
+    try {
+      parsed = text ? JSON.parse(text) : null;
+    } catch {
+      parsed = { raw: text };
+    }
+    return { status: response.status, kind: notification ? '通知' : '请求', body, parsed };
+  }
+}
+
+/** 打印一次往返。 */
+function trace({ kind, body, status, parsed }) {
+  console.log(`→ [${kind}] ${JSON.stringify(body)}`);
+  if (status === 204) {
+    console.log('← 204 无响应体（通知按协议不回）');
+  } else {
+    console.log(`← ${status} ${JSON.stringify(parsed)}`);
+  }
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  const endpointFile = endpointPath();
   if (args.help) {
     console.log(`
-用法：node scripts/host-sim.mjs [--host pi] [--socket <path>] [--step <ms>] [--keep-alive]
+用法：node scripts/host-sim.mjs [--host pi] [--step <ms>] [--wait <ms>] [--keep-alive]
 
-  --host       宿主标识（默认 ${DEFAULT_HOST}）
-  --socket     socket 路径（默认 ${defaultSocket()}）
-  --step       每步间隔毫秒（默认 ${DEFAULT_STEP_MS}；设 0 可快速跑完）
-  --wait       等 socket 出现的超时毫秒（默认 ${DEFAULT_WAIT_MS}）
-  --keep-alive 演完后保持连接，直到 Ctrl-C（用于观察 linger 行为）
+  --host        宿主标识（默认 ${DEFAULT_HOST}）
+  --step        每步间隔毫秒（默认 ${DEFAULT_STEP_MS}；设 0 可快速跑完）
+  --wait        等对接信息出现的超时毫秒（默认 ${DEFAULT_WAIT_MS}）
+  --keep-alive  演完后保持心跳，直到 Ctrl-C（用于观察 linger 行为）
+
+对接信息文件：${endpointFile}
 `);
     return;
   }
 
   const host = args.host || DEFAULT_HOST;
-  const socket = args.socket || defaultSocket();
   const step = args.step === undefined ? DEFAULT_STEP_MS : Number(args.step);
   const keepAlive = Boolean(args['keep-alive']);
   const waitMs = args.wait === undefined ? DEFAULT_WAIT_MS : Number(args.wait);
 
-  if (!(await waitForSocket(socket, waitMs))) {
-    console.error(`等待 ${waitMs}ms 后仍未出现 socket：${socket}（daemon 未启动？）`);
-    process.exit(1);
-  }
+  const endpoint = await waitForEndpoint(endpointFile, waitMs);
+  const url = `http://127.0.0.1:${endpoint.port}/rpc`;
+  console.log(`已读取对接信息 ${endpointFile}`);
+  console.log(`端点 ${url}（protocol=${endpoint.protocolVersion}，host=${host}）`);
 
-  const stream = net.connect(socket);
-  let buffer = '';
+  const client = new RpcClient(url, endpoint.token);
 
-  stream.on('data', (chunk) => {
-    buffer += chunk.toString('utf8');
-    let index = buffer.indexOf('\n');
-    while (index >= 0) {
-      const line = buffer.slice(0, index);
-      buffer = buffer.slice(index + 1);
-      if (line.trim()) console.log(`← ${line}`);
-      index = buffer.indexOf('\n');
-    }
-  });
-  stream.on('error', (err) => {
-    console.error(`连接失败：${err.message}`);
-    process.exitCode = 1;
-  });
-
-  await new Promise((resolve, reject) => {
-    stream.once('connect', resolve);
-    stream.once('error', reject);
-  });
-  console.log(`已连接 ${socket}（host=${host}）`);
-
-  /** 发一帧并打印。 */
-  const send = (type, payload) => {
-    const line = frame(host, type, payload);
-    console.log(`→ ${line.trim()}`);
-    stream.write(line);
+  /** 发一次请求并打印。 */
+  const request = async (method, params) => {
+    const outcome = await client.call(method, params);
+    trace(outcome);
+    return outcome.parsed;
   };
 
-  // 握手必须是第一帧（协议 §4.1）。
-  send('host.hello', { pid: process.pid, agentVersion: 'sim-1.0.0', clientVersion: 'node-sim' });
+  /** 发一个通知并打印。 */
+  const notify = async (method, params) => {
+    trace(await client.call(method, params, { notification: true }));
+  };
+
+  // 握手必须是第一个请求（协议 §4.1）。
+  await request(METHOD.hostHello, {
+    host,
+    protocolVersion: PROTOCOL_VERSION,
+    pid: process.pid,
+    agentVersion: 'sim-1.0.0',
+    clientVersion: 'node-sim',
+  });
   await sleep(step);
 
   // 一整轮 agent 生命周期 + 工具事件 + 自定气泡。
-  send('agent.start', { sessionId: 'sess-sim-1', summary: '验证桌宠联动' });
+  await notify(METHOD.agentStart, { host, sessionId: 'sess-sim-1', summary: '验证桌宠联动' });
   await sleep(step);
 
-  send('tool.start', { toolName: 'bash', bubble: 'ls -la' });
+  await notify(METHOD.toolStart, { host, toolName: 'bash', bubble: 'ls -la' });
   await sleep(step);
 
-  send('ping', { ts: Date.now() });
+  await request(METHOD.daemonPing, { host, ts: Date.now() });
   await sleep(step);
 
-  send('tool.end', { toolName: 'bash' });
+  await notify(METHOD.toolEnd, { host, toolName: 'bash' });
   await sleep(step);
 
-  send('tool.start', { toolName: 'grep' });
+  await notify(METHOD.toolStart, { host, toolName: 'grep' });
   await sleep(step);
 
-  send('tool.end', { toolName: 'grep', isError: true });
+  await notify(METHOD.toolEnd, { host, toolName: 'grep', isError: true });
   await sleep(step);
 
-  send('bubble', { kind: 'warning', text: '这是一条宿主自定气泡', ttlMs: 3000 });
+  await notify(METHOD.petBubble, {
+    host,
+    kind: 'warning',
+    text: '这是一条宿主自定气泡',
+    ttlMs: 3000,
+  });
   await sleep(step);
 
-  // 未知 type 必须被静默忽略（协议 §3 前向兼容）。
-  send('future.unknown', { anything: true });
+  // 未知通知必须被静默忽略（协议 §3 前向兼容）。
+  await notify('future/unknown', { anything: true });
   await sleep(step);
 
-  send('agent.end', { sessionId: 'sess-sim-1', success: true });
+  // 未知请求必须回 -32601，宿主才好发现自己写错了方法名。
+  await request('pet/teleport', { host });
+  await sleep(step);
+
+  await request(METHOD.daemonInfo, {});
+  await sleep(step);
+
+  await notify(METHOD.agentEnd, { host, sessionId: 'sess-sim-1', success: true });
   await sleep(step * 2);
 
   if (keepAlive) {
-    console.log('保持连接中，Ctrl-C 结束');
-    setInterval(() => send('ping', { ts: Date.now() }), 5000);
+    console.log('保持心跳中，Ctrl-C 结束');
+    setInterval(() => {
+      void request(METHOD.daemonPing, { host, ts: Date.now() });
+    }, PING_MS);
     return;
   }
 
-  console.log('关闭连接（daemon 应立即注销本宿主，进入 linger）');
-  stream.end();
+  console.log('道别（daemon 应立即注销本宿主，进入 linger）');
+  await notify(METHOD.hostBye, { host, reason: '模拟器收工' });
 }
 
 main().catch((err) => {
-  console.error(err);
+  console.error(err.message ?? err);
   process.exit(1);
 });
