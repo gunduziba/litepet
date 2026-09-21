@@ -1,7 +1,7 @@
 // 桌面宠物渲染层：按播放计划切图集，并渲染 daemon 推来的显示指令。
 //
 // 数据来源：Rust 侧 `pack_info` 命令（见 src/pack.rs）与 Tauri 事件 `display`
-// （载荷为 `protocol::DisplayDirective`）。
+// （载荷为 `protocol::DisplayDirective`）、`pet-changed`（载荷为 `pack::PetInfo`）。
 // 本层不做任何状态判断：动画名与气泡全由 daemon 决定（docs/PROTOCOL.md）。
 
 const { invoke } = window.__TAURI__.core;
@@ -105,16 +105,35 @@ function apply(directive) {
   }).catch(() => {});
 }
 
-/** 订阅 daemon 推来的显示指令。 */
-async function watchDisplay() {
-  await window.__TAURI__.event.listen('display', (event) => apply(event.payload));
+/** 换用一份宠物包信息：更新图集地址与标题，并从 idle 重新开始。 */
+function usePack(info) {
+  pack = info;
+  sheetUrl = convertFileSrc(info.spritesheetPath);
+  document.title = info.displayName;
+  // 必须清掉当前动画名：新包的动画名集合与旧包可能完全不同，
+  // 留着旧名字会让 `play` 的同名直返判断把新包的第一帧吞掉。
+  currentName = '';
+  frameIndex = 0;
+  clearTimeout(timer);
+  const names = Object.keys(info.animations);
+  play(names.includes('idle') ? 'idle' : names[0]);
+}
+
+/** 订阅 daemon 推来的事件：显示指令与换包。 */
+async function watchEvents() {
+  const { event } = window.__TAURI__;
+  await event.listen('display', (e) => apply(e.payload));
+  await event.listen('pet-changed', (e) => {
+    usePack(e.payload);
+    invoke('renderer_ready', {
+      animations: Object.keys(pack.animations).length,
+    }).catch(() => {});
+  });
 }
 
 /** 启动：拉包信息、进入 idle、挂事件与 resize。 */
 async function boot() {
-  pack = await invoke('pack_info');
-  sheetUrl = convertFileSrc(pack.spritesheetPath);
-  document.title = pack.displayName;
+  usePack(await invoke('pack_info'));
   window.addEventListener('resize', redraw);
   // 调试入口：控制台可 __pet.play('waving') / __pet.apply({animation:'idle'})
   window.__pet = {
@@ -125,9 +144,10 @@ async function boot() {
       return pack;
     },
   };
-  play('idle');
-  await invoke('renderer_ready', { animations: Object.keys(pack.animations).length });
-  await watchDisplay();
+  await invoke('renderer_ready', {
+    animations: Object.keys(pack.animations).length,
+  });
+  await watchEvents();
 }
 
 boot().catch((err) => console.error('litepet: 渲染层启动失败', err));

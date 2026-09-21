@@ -127,6 +127,23 @@ impl Session {
         })
     }
 
+    /// 换一只宠物：保留宿主注册与计时，只换掉包的规则与动画表。
+    ///
+    /// 为什么不直接重建一个 [`Session`]：重建会把宿主全忘掉，正在跑的 pi/dsh
+    /// 必须重新 `host/hello` 才能再驱动宠物——而用户换宠物包时并没有断连，
+    /// 凭什么要它们重连。
+    ///
+    /// 失败时保持原样：先把新规则构造好再落进字段，不存在「换了一半」的状态。
+    pub fn rebind(&mut self, setup: Setup) -> Result<()> {
+        let behavior = Behavior::new(setup.litepet.as_ref(), &setup.known)?;
+        self.behavior = behavior;
+        self.known = setup.known;
+        self.pet_id = setup.pet_id;
+        // 去重缓存要清掉：新包的第一帧必须推出去，否则换了宠物画面还是旧的。
+        self.last = None;
+        Ok(())
+    }
+
     /// 取走待发提醒。
     ///
     /// 用「取走」而不是「读一下」的语义：提醒是一次性的，

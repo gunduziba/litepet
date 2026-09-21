@@ -1,0 +1,247 @@
+// LitePet 设置页样式。
+//
+// 刻意不复用 pet.css：那一份是给透明无边框的宠物窗口用的，
+// 这里的窗口是普通窗口，两者从底子到目标都不一样，混在一起只会互相牵制。
+
+:root {
+  color-scheme: dark;
+  --bg: #1c1c1f;
+  --panel: #26262b;
+  --line: #35353c;
+  --text: #ececf1;
+  --dim: #9a9aa6;
+  --accent: #6ea8fe;
+  --danger: #ff6b6b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0 0 48px;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.5 -apple-system, "Helvetica Neue", "Microsoft YaHei", sans-serif;
+  /* 设置窗口是给人读的，不要像宠物那样禁止选择。 */
+  user-select: text;
+}
+
+header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 16px 20px 12px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+
+h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+h2 {
+  margin: 0 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  text-transform: uppercase;
+}
+
+main {
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+section {
+  padding: 14px 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 0;
+}
+
+.row > .label {
+  flex: 0 0 72px;
+  color: var(--dim);
+}
+
+input[type="text"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 5px 8px;
+  background: #1a1a1e;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+input[type="range"] {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+}
+
+output {
+  flex: 0 0 52px;
+  text-align: right;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+button {
+  padding: 5px 12px;
+  background: #303038;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: #3a3a44;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.hint {
+  margin: 0 0 8px;
+  color: var(--dim);
+  font-size: 12px;
+}
+
+code {
+  padding: 1px 4px;
+  background: #1a1a1e;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+/* 宠物列表 */
+.pets {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pets li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.pets li:hover {
+  border-color: var(--accent);
+}
+
+.pets li[aria-current="true"] {
+  border-color: var(--accent);
+  background: #2c3444;
+}
+
+/* 坏包：仍然列出来，但不给点。 */
+.pets li.broken {
+  cursor: default;
+  opacity: 0.75;
+}
+
+.pets li.broken:hover {
+  border-color: var(--line);
+}
+
+.pets .name {
+  font-weight: 600;
+}
+
+.pets .id,
+.pets .problem {
+  color: var(--dim);
+  font-size: 12px;
+}
+
+.pets .problem {
+  color: var(--danger);
+}
+
+.pets .spacer {
+  flex: 1 1 auto;
+}
+
+/* 首帧预览：把图集的第一格抠出来。 */
+.preview {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  background-repeat: no-repeat;
+  image-rendering: pixelated;
+  border-radius: 6px;
+  background-color: #1a1a1e;
+}
+
+/* 路径列表 */
+dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+}
+
+dt {
+  color: var(--dim);
+}
+
+dd {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+/* 底部状态提示 */
+.status {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  margin: 0;
+  padding: 10px 20px;
+  font-size: 12px;
+  background: #2c3444;
+  border-top: 1px solid var(--line);
+}
+
+.status[data-error="true"] {
+  background: #43262c;
+  color: #ffd9d9;
+}

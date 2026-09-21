@@ -33,6 +33,10 @@ const TOKEN_BYTES: usize = 16;
 const PRIVATE_MODE: u32 = 0o600;
 /// 默认窗口边长（像素）。
 const DEFAULT_SIZE: u32 = 220;
+
+/// 窗口边长的可用范围。比 64 更小就看不出一只宠物，比 512 更大也谈不上「待在角落」。
+const MIN_SIZE: u32 = 64;
+const MAX_SIZE: u32 = 512;
 /// 默认音量。
 const DEFAULT_SOUND_VOLUME: f32 = 0.35;
 /// 默认推送服务。
@@ -75,6 +79,41 @@ impl Default for Config {
             always_on_top: true,
             port: DEFAULT_PORT,
             notify: NotifyConfig::default(),
+        }
+    }
+}
+
+impl Config {
+    /// 把读来的值夹进可用范围。
+    ///
+    /// 配置是可以被手改的（现在也由配置页写），而越界的值不会报错、只会让现象变得
+    /// 莫名其妙：`size: 0` 是一只看不见的宠物，`volume: 5` 是一声被削平的噪声，
+    /// `port: 0` 会让端点文件里写一个没人监听的端口号、宿主连上来才发现不对。
+    /// 所以每次读出来先夹一遍再往下传。
+    pub fn normalize(&mut self) {
+        if !(MIN_SIZE..=MAX_SIZE).contains(&self.size) {
+            let clamped = self.size.clamp(MIN_SIZE, MAX_SIZE);
+            log::warn!(
+                "配置 size={} 超出 {}..={}，按 {} 处理",
+                self.size,
+                MIN_SIZE,
+                MAX_SIZE,
+                clamped
+            );
+            self.size = clamped;
+        }
+        if !(0.0..=1.0).contains(&self.notify.sound.volume) {
+            let clamped = self.notify.sound.volume.clamp(0.0, 1.0);
+            log::warn!(
+                "配置 volume={} 超出 0..=1，按 {} 处理",
+                self.notify.sound.volume,
+                clamped
+            );
+            self.notify.sound.volume = clamped;
+        }
+        if self.port == 0 {
+            log::warn!("配置 port=0 没有可监听的含义，按 {} 处理", DEFAULT_PORT);
+            self.port = DEFAULT_PORT;
         }
     }
 }
@@ -267,11 +306,38 @@ pub fn random_token() -> Result<String> {
     Ok(token)
 }
 
-/// 以 `0600` 写文件：对接信息里有密钥，不能让同机其他用户读到。
+/// 在 `path` 旁边造一个 `<文件名><后缀>` 的兄弟路径。
+///
+/// 用拼接而不是 `with_extension`：后者会把原扩展名换掉，
+/// `config.json` 得到的名字读起来像是另一种文件格式。
+fn sibling(path: &Path, suffix: &str) -> Result<PathBuf> {
+    let mut name = path.file_name().context("配置路径无文件名")?.to_os_string();
+    name.push(suffix);
+    Ok(path.with_file_name(name))
+}
+
+/// 以 `0600` 原子写文件：对接信息里有密钥，不能让同机其他用户读到。
+///
+/// **先写 `.tmp` 再 `rename`**：就地截断重写一旦中途失败（断电、被 kill、
+/// 磁盘满），留在盘上的是一份残缺的 JSON，而下次启动就再也读不出配置了。
+/// `rename` 在同一文件系统内是原子的，所以任何时刻读到的要么是完整旧文件、
+/// 要么是完整新文件。
+fn write_private(path: &Path, body: &str) -> Result<()> {
+    let tmp = sibling(path, ".tmp")?;
+    write_private_body(&tmp, body)?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        // 别把半成品留在目录里让用户困惑；下次写入本来也会覆盖它。
+        let _ = fs::remove_file(&tmp);
+        return Err(err).with_context(|| format!("替换失败：{}", path.display()));
+    }
+    Ok(())
+}
+
+/// 单文件写入（`0600` 且落盘），不做原子处理，只被 `write_private` 用来写临时文件。
 ///
 /// `mode()` 只在创建时生效，因此已有文件额外补一次 `set_permissions`，
 /// 避免「上一次残留了权限过宽的文件」继承下来。
-fn write_private(path: &Path, body: &str) -> Result<()> {
+fn write_private_body(path: &Path, body: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("创建家目录失败：{}", parent.display()))?;
@@ -285,22 +351,44 @@ fn write_private(path: &Path, body: &str) -> Result<()> {
         .with_context(|| format!("写入失败：{}", path.display()))?;
     file.write_all(body.as_bytes())
         .with_context(|| format!("写入失败：{}", path.display()))?;
+    // 不落盘的话，`rename` 可能先于数据到达磁盘：崩溃后留下一个名字对、
+    // 内容空的文件——比截断更难查。
+    file.sync_all()
+        .with_context(|| format!("落盘失败：{}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_MODE))
         .with_context(|| format!("设置权限失败：{}", path.display()))?;
     Ok(())
 }
 
-/// 读取配置；文件不存在时创建家目录并写入默认配置。
+/// 从 `path` 读配置；文件不存在就建目录并写入默认配置。
 ///
-/// 返回 (配置, 是否为新建)。
-pub fn load_or_init() -> Result<(Config, bool)> {
-    let path = config_path()?;
+/// 收路径参数是为了能在临时目录里测「配置损坏」那条分支：它靠环境变量
+/// `LITEPET_HOME` 测不稳（并发跑的测试会互相改环境）。
+fn load_config_at(path: &Path) -> Result<(Config, bool)> {
     if path.is_file() {
-        let raw = fs::read_to_string(&path)
+        let raw = fs::read_to_string(path)
             .with_context(|| format!("读取配置失败：{}", path.display()))?;
-        let cfg: Config = serde_json::from_str(&raw)
-            .with_context(|| format!("解析配置失败：{}", path.display()))?;
-        return Ok((cfg, false));
+        match serde_json::from_str::<Config>(&raw) {
+            Ok(mut cfg) => {
+                cfg.normalize();
+                return Ok((cfg, false));
+            }
+            // 读不懂的配置不该把 daemon 拦在门外：「用默认值起来」和「起不来」
+            // 对用户是两种完全不同的体验。坏文件挪到一旁留证，然后用默认值继续。
+            Err(err) => {
+                let broken = sibling(path, ".broken")?;
+                log::warn!(
+                    "配置解析失败（{err}），已备份到 {}，本次用默认值启动",
+                    broken.display()
+                );
+                if let Err(err) = fs::rename(path, &broken) {
+                    log::warn!("备份坏配置失败：{err}");
+                }
+                let cfg = Config::default();
+                save_at(path, &cfg)?;
+                return Ok((cfg, true));
+            }
+        }
     }
     let parent = path.parent().context("配置路径无父目录")?;
     fs::create_dir_all(parent).with_context(|| format!("创建家目录失败：{}", parent.display()))?;
@@ -308,17 +396,28 @@ pub fn load_or_init() -> Result<(Config, bool)> {
     let pets = pets_dir()?;
     fs::create_dir_all(&pets).with_context(|| format!("创建宠物目录失败：{}", pets.display()))?;
     let cfg = Config::default();
-    save(&cfg)?;
+    save_at(path, &cfg)?;
     Ok((cfg, true))
+}
+
+/// 读取配置；文件不存在时创建家目录并写入默认配置。
+///
+/// 返回 (配置, 是否为新建)。
+pub fn load_or_init() -> Result<(Config, bool)> {
+    load_config_at(&config_path()?)
 }
 
 /// 写回配置。
 ///
 /// 走私有写入：配置里有明文推送密钥，不能让同机其他用户读到。
 pub fn save(cfg: &Config) -> Result<()> {
-    let path = config_path()?;
+    save_at(&config_path()?, cfg)
+}
+
+/// 往指定路径写回配置（`load_config_at` 与 `save` 共用）。
+fn save_at(path: &Path, cfg: &Config) -> Result<()> {
     let body = serde_json::to_string_pretty(cfg).context("序列化配置失败")?;
-    write_private(&path, &body)
+    write_private(path, &body)
 }
 
 #[cfg(test)]
@@ -469,5 +568,96 @@ mod tests {
         let legacy = r#"{"pet":"xunjian-miao","size":220,"alwaysOnTop":true}"#;
         let parsed: Config = serde_json::from_str(legacy).expect("应能读取旧配置");
         assert_eq!(parsed.port, DEFAULT_PORT);
+    }
+
+    /// 造一个本次调用独占的临时目录（测试并发跑，不能撞名）。
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or_default();
+        let dir =
+            std::env::temp_dir().join(format!("litepet-{tag}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).expect("应能建临时目录");
+        dir
+    }
+
+    /// 越界的值要被夹回可用范围：这些字段现在会由配置页写，也可能被手改。
+    #[test]
+    fn normalize_clamps_out_of_range() {
+        let mut cfg = Config {
+            size: 0,
+            ..Config::default()
+        };
+        cfg.notify.sound.volume = 5.0;
+        cfg.port = 0;
+        cfg.normalize();
+        assert_eq!(cfg.size, MIN_SIZE, "size=0 要抬到下限");
+        assert_eq!(cfg.notify.sound.volume, 1.0, "音量上限是 1");
+        assert_eq!(cfg.port, DEFAULT_PORT, "port=0 无法监听，要回退默认端口");
+
+        let mut big = Config {
+            size: 99_999,
+            ..Config::default()
+        };
+        big.notify.sound.volume = -1.0;
+        big.normalize();
+        assert_eq!(big.size, MAX_SIZE, "过大的尺寸要压到上限");
+        assert_eq!(big.notify.sound.volume, 0.0, "音量下限是 0");
+    }
+
+    /// 范围内的值不得被 `normalize` 动过，否则它会变成一个「每次读都改配置」的东西。
+    #[test]
+    fn normalize_keeps_values_in_range() {
+        let mut cfg = Config {
+            size: 300,
+            port: 4700,
+            ..Config::default()
+        };
+        cfg.notify.sound.volume = 0.6;
+        cfg.normalize();
+        assert_eq!(cfg.size, 300);
+        assert_eq!(cfg.port, 4700);
+        assert_eq!(cfg.notify.sound.volume, 0.6);
+    }
+
+    /// 配置被写坏时不能把 daemon 拦在门外：备份坏文件后用默认值继续。
+    #[test]
+    fn corrupt_config_falls_back_to_defaults() {
+        let dir = temp_dir("corrupt");
+        let path = dir.join(CONFIG_FILE);
+        let garbage = r#"{"pet":"xunjian-miao",,,"#;
+        fs::write(&path, garbage).expect("应能写入坏配置");
+
+        let (cfg, created) = load_config_at(&path).expect("坏配置不该导致失败");
+        assert!(created, "重建过配置就算新建");
+        assert_eq!(cfg.size, DEFAULT_SIZE, "应拿到一份默认配置");
+
+        // 坏文件必须留着：用户可能想自己看一眼到底哪里写错了。
+        let broken = sibling(&path, ".broken").expect("应能算出备份路径");
+        assert_eq!(fs::read_to_string(&broken).expect("应能读备份"), garbage);
+        // 而原位置应该已经是一份能读的配置。
+        let (again, created) = load_config_at(&path).expect("重读要成功");
+        assert!(!created, "第二次不是新建");
+        assert_eq!(again.size, DEFAULT_SIZE);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 原子写不得在目录里留下 `.tmp`，否则用户会看到一个来历不明的文件。
+    #[test]
+    fn atomic_write_leaves_no_temp_file() {
+        let dir = temp_dir("atomic");
+        let path = dir.join(CONFIG_FILE);
+        let cfg = Config::default();
+
+        save_at(&path, &cfg).expect("应能写入");
+        // 再写一次，覆盖已存在的文件（rename 覆盖这条路）。
+        save_at(&path, &cfg).expect("应能覆盖写入");
+
+        let tmp = sibling(&path, ".tmp").expect("应能算出临时路径");
+        assert!(!tmp.exists(), "写完不该留下 {}", tmp.display());
+        let (loaded, _) = load_config_at(&path).expect("应能读回");
+        assert_eq!(loaded.port, cfg.port);
+        fs::remove_dir_all(&dir).ok();
     }
 }

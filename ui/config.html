@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>LitePet 设置</title>
+    <link rel="stylesheet" href="config.css" />
+  </head>
+  <body>
+    <header>
+      <h1>LitePet 设置</h1>
+      <p class="hint" id="meta">加载中…</p>
+    </header>
+
+    <main>
+      <section>
+        <h2>宠物</h2>
+        <p class="hint">
+          从 <code id="pets-root">~/.litepet/pets</code> 读取。坏包也会列出来，
+          并说明坏在哪。
+        </p>
+        <ul class="pets" id="pets"></ul>
+      </section>
+
+      <section>
+        <h2>窗口</h2>
+        <div class="row">
+          <span class="label">尺寸</span>
+          <input id="size" type="range" min="64" max="512" step="4" />
+          <output id="size-out">—</output>
+        </div>
+        <label class="row">
+          <input id="always-on-top" type="checkbox" />
+          <span>始终置顶</span>
+        </label>
+      </section>
+
+      <section>
+        <h2>提醒</h2>
+        <p class="hint">
+          哪些事件要提醒由宠物包的规则表决定，这里只管通道开关。
+          「人在不在」由 pi / dsh 自己判断，litepet 不问。
+        </p>
+        <label class="row">
+          <input id="notify-enabled" type="checkbox" />
+          <span>启用提醒（关掉则整层静默）</span>
+        </label>
+        <label class="row">
+          <input id="sound-enabled" type="checkbox" />
+          <span>播放音效</span>
+        </label>
+        <div class="row">
+          <span class="label">音量</span>
+          <input id="sound-volume" type="range" min="0" max="1" step="0.05" />
+          <output id="volume-out">—</output>
+        </div>
+        <label class="row">
+          <input id="desktop-enabled" type="checkbox" />
+          <span>系统通知</span>
+        </label>
+        <label class="row">
+          <input id="push-enabled" type="checkbox" />
+          <span>推送到手机（Bark）</span>
+        </label>
+        <div class="row">
+          <span class="label">设备密钥</span>
+          <input
+            id="push-key"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="Bark deviceKey"
+          />
+        </div>
+        <div class="row">
+          <span class="label">服务地址</span>
+          <input
+            id="push-endpoint"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="留空用官方服务器"
+          />
+        </div>
+        <div class="row">
+          <button id="test">测试提醒</button>
+          <span class="hint" id="test-out"></span>
+        </div>
+      </section>
+
+      <section>
+        <h2>路径</h2>
+        <dl id="paths"></dl>
+      </section>
+    </main>
+
+    <p id="status" class="status" hidden></p>
+    <script src="config.js"></script>
+  </body>
+</html>

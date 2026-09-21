@@ -16,6 +16,7 @@ mod manifest;
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 /// 清单文件名。
@@ -127,6 +128,96 @@ pub fn load(pets_root: &Path, id: &str) -> Result<LoadedPet> {
         behavior: file.litepet.clone(),
         root: dir,
     })
+}
+
+/// 配置页宠物列表里的一项：够显示、够选择，不求能渲染。
+///
+/// 与 [`PetInfo`] 的区别是**不建动画表**（那只在图集与网格都合法时才有意义），
+/// 只读清单与图集文件头。列表必须能容忍个别坏包：一个包有问题不该让整列都拉不出来。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PetSummary {
+    /// 目录名；`load` 用它作为清单缺 `id` 时的兜底。
+    pub dir: String,
+    /// 清单里的 id；缺省时回落成目录名（与 `load` 的取值一致）。
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    /// 图集绝对路径。配置页的首帧预览要用它。
+    pub spritesheet_path: Option<String>,
+    /// 网格规格。预览要靠它算出「第一格」该裁哪块区域。
+    pub frame: Option<GridSpec>,
+    /// 这个包坏在哪；`None` 表示清单、图集、网格都读得通。
+    ///
+    /// 坏包仍然列出来：用户明明装了它，凭空消失只会让人怀疑自己装错了地方。
+    pub problem: Option<String>,
+}
+
+/// 列出 `pets_root` 下所有可选的宠物包。
+///
+/// 按目录名排序：`read_dir` 的顺序各文件系统不同，配置页每次刷新看到的顺序
+/// 都变一遭会很难用。
+pub fn list(pets_root: &Path) -> Vec<PetSummary> {
+    let Ok(entries) = fs::read_dir(pets_root) else {
+        // 家目录还没建起来时不是错误，只是「一个包都没有」。
+        return Vec::new();
+    };
+    let mut found: Vec<PetSummary> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            summarize(&entry.path(), pets_root, &name)
+        })
+        .collect();
+    found.sort_by(|a, b| a.dir.cmp(&b.dir));
+    found
+}
+
+/// 把一个目录总结成列表项；没有 `pet.json` 的目录返回 `None`。
+///
+/// 「没有清单」与「清单是坏的」必须分开：前者多半不是宠物包（`pets/` 下混着
+/// 说明目录很常见），静默跳过；后者是用户以为装好了的东西，要列出来并告诉他坏在哪。
+fn summarize(dir: &Path, pets_root: &Path, name: &str) -> Option<PetSummary> {
+    let manifest_path = dir.join(PET_FILE);
+    if !manifest_path.is_file() {
+        return None;
+    }
+    let mut summary = PetSummary {
+        dir: name.to_string(),
+        id: name.to_string(),
+        display_name: name.to_string(),
+        description: String::new(),
+        spritesheet_path: None,
+        frame: None,
+        problem: None,
+    };
+    let file = match manifest::PetFile::from_path(&manifest_path) {
+        Ok(file) => file,
+        Err(err) => {
+            summary.problem = Some(format!("{err:#}"));
+            return Some(summary);
+        }
+    };
+    summary.id = file.id.clone().unwrap_or_else(|| name.to_string());
+    summary.display_name = file
+        .display_name
+        .clone()
+        .unwrap_or_else(|| name.to_string());
+    summary.description = file.description.clone().unwrap_or_default();
+
+    // 图集只读文件头：配置页要的是「能不能预览」，不是「能不能渲染」。
+    let resolved = resolve_spritesheet(dir, pets_root, file.spritesheet_path.as_deref())
+        .and_then(|sheet| image::read_size(&sheet).map(|atlas| (sheet, atlas)))
+        .and_then(|(sheet, atlas)| manifest::resolve_grid(&file, atlas).map(|grid| (sheet, grid)));
+    match resolved {
+        Ok((sheet, grid)) => {
+            summary.spritesheet_path = Some(sheet.to_string_lossy().into_owned());
+            summary.frame = Some(grid);
+        }
+        Err(err) => summary.problem = Some(format!("{err:#}")),
+    }
+    Some(summary)
 }
 
 /// 定位并校验图集路径。
@@ -309,5 +400,96 @@ mod tests {
             checked += 1;
         }
         println!("已校验 {checked} 个真实本机宠物包");
+    }
+
+    /// 造一个能装多个包的临时 `pets/` 根目录。
+    ///
+    /// `make_pack` 一次只造一个包，而列表接口要的恰好是「一个根目录下好几个包」。
+    fn make_pets_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("{TEST_ROOT}-list-{tag}"));
+        let _ = fs::remove_dir_all(&root);
+        let pets = root.join("pets");
+        fs::create_dir_all(&pets).expect("建目录失败");
+        pets
+    }
+
+    /// 往根目录下写一个能完整加载的包。
+    fn write_ok_pack(pets: &Path, dir_name: &str) {
+        let pet = pets.join(dir_name);
+        fs::create_dir_all(&pet).expect("建目录失败");
+        let manifest = format!(
+            r#"{{"id":"{dir_name}","displayName":"名称-{dir_name}","description":"描述","spritesheetPath":"spritesheet.png"}}"#
+        );
+        fs::write(pet.join(PET_FILE), manifest).expect("写清单失败");
+        write_atlas(&pet.join("spritesheet.png"), V2_ATLAS.0, V2_ATLAS.1);
+    }
+
+    /// 列表要按目录名排序，跳过不是宠物包的目录，并容忍根目录不存在。
+    #[test]
+    fn list_sorts_and_skips_non_packs() {
+        let pets = make_pets_root("sort");
+        write_ok_pack(&pets, "charlie");
+        write_ok_pack(&pets, "alpha");
+        write_ok_pack(&pets, "bravo");
+        // 没有 pet.json 的目录与顶层散文件都不是宠物包
+        fs::create_dir_all(pets.join("readme-dir")).expect("建目录失败");
+        fs::write(pets.join("loose.txt"), b"x").expect("写文件失败");
+
+        let found = list(&pets);
+        let dirs: Vec<&str> = found.iter().map(|pet| pet.dir.as_str()).collect();
+        assert_eq!(dirs, ["alpha", "bravo", "charlie"], "要按目录名排序");
+        assert!(found.iter().all(|pet| pet.problem.is_none()));
+
+        // 家目录还不存在时是空列表，不是 panic
+        assert!(list(&pets.join("不存在的目录")).is_empty());
+        let _ = fs::remove_dir_all(pets.parent().expect("有父目录"));
+    }
+
+    /// 列表项要带上图集与网格：配置页靠它们裁出第一格做预览。
+    #[test]
+    fn list_fills_path_and_frame_for_preview() {
+        let pets = make_pets_root("preview");
+        write_ok_pack(&pets, "miao");
+
+        let found = list(&pets);
+        assert_eq!(found.len(), 1);
+        let pet = &found[0];
+        assert_eq!(pet.id, "miao");
+        assert_eq!(pet.display_name, "名称-miao");
+        assert_eq!(pet.description, "描述");
+        let sheet = pet.spritesheet_path.as_deref().expect("应有图集路径");
+        assert!(sheet.ends_with("spritesheet.png"), "实际为 {sheet}");
+        let frame = pet.frame.expect("应有网格");
+        assert_eq!((frame.columns, frame.rows), (8, 11));
+        let _ = fs::remove_dir_all(pets.parent().expect("有父目录"));
+    }
+
+    /// 坏包也要列出来（带原因）：用户明明装了它，凭空消失更难查。
+    #[test]
+    fn list_reports_broken_pack_with_reason() {
+        let pets = make_pets_root("broken");
+        // 清单是坏 JSON
+        let bad = pets.join("bad-json");
+        fs::create_dir_all(&bad).expect("建目录失败");
+        fs::write(bad.join(PET_FILE), b"{not json").expect("写清单失败");
+        // 清单能读，但图集缺失
+        let missing = pets.join("missing-sheet");
+        fs::create_dir_all(&missing).expect("建目录失败");
+        fs::write(missing.join(PET_FILE), r#"{"spritesheetPath":"nope.png"}"#).expect("写清单失败");
+
+        let found = list(&pets);
+        assert_eq!(found.len(), 2, "两个坏包都要在列表里");
+        for pet in &found {
+            let problem = pet.problem.as_deref().expect("应给出坏在哪");
+            assert!(!problem.is_empty(), "坏因不能是空字符串");
+            assert_eq!(pet.id, pet.dir, "清单读不通时 id 回落成目录名");
+            assert!(pet.frame.is_none());
+        }
+        let bad_json = found
+            .iter()
+            .find(|pet| pet.dir == "bad-json")
+            .expect("应有 bad-json");
+        assert!(bad_json.spritesheet_path.is_none());
+        let _ = fs::remove_dir_all(pets.parent().expect("有父目录"));
     }
 }
