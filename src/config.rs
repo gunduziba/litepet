@@ -94,8 +94,9 @@ pub fn load_or_init() -> Result<(Config, bool)> {
     }
     let parent = path.parent().context("配置路径无父目录")?;
     fs::create_dir_all(parent).with_context(|| format!("创建家目录失败：{}", parent.display()))?;
-    fs::create_dir_all(pets_dir()?) // 顺带建好 pets/，避免首次启动时目录缺失
-        .with_context(|| format!("创建宠物目录失败：{}", pets_dir()?.display()))?;
+    // 顺带建好 pets/，避免首次启动时目录缺失
+    let pets = pets_dir()?;
+    fs::create_dir_all(&pets).with_context(|| format!("创建宠物目录失败：{}", pets.display()))?;
     let cfg = Config::default();
     save(&cfg)?;
     Ok((cfg, true))
