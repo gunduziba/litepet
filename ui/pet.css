@@ -1,0 +1,25 @@
+/* 桌面宠物渲染层：窗口整体穿透透明，只有精灵图当前格可见。 */
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  /* 窗口本身透明（tauri.conf.json 已置 transparent: true），页面不能铺底色 */
+  background: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+  /* 第一版整窗可拖；后续做点选穿透时收窄到 .pet 上 */
+  cursor: grab;
+}
+
+/* 图集视口：一格一格地移动 background-position。 */
+.pet {
+  width: 100%;
+  height: 100%;
+  background-color: transparent;
+  background-repeat: no-repeat;
+  /* 不做 pixelated：多数素材是平滑绘制的，放大时保留插值更好看 */
+}

@@ -1,0 +1,22 @@
+[package]
+name = "pet-daemon"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "统一的桌面宠物 daemon，为 pi 与 dsh 宿主提供宠物显示"
+license = "Apache-2.0"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
