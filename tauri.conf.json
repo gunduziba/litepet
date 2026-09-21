@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "LitePet",
-  "version": "0.1.0",
   "identifier": "com.litepet.desktop",
   "build": {
     "frontendDist": "./ui"
@@ -33,13 +32,34 @@
     }
   },
   "bundle": {
-    "active": false,
-    "targets": "all",
+    "active": true,
+    "targets": ["app", "dmg", "nsis"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
-      "icons/icon.png"
-    ]
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Entertainment",
+    "license": "Apache-2.0",
+    "shortDescription": "统一的桌面宠物",
+    "longDescription": "LitePet 是一个桌面宠物 daemon：pi 与 dsh 通过 HTTP + JSON-RPC 驱动它显示宠物与提醒。窗口常驻桌面，提醒通道（音效 / 系统通知 / 手机推送）由宠物包的规则表决定。",
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "hardenedRuntime": true
+    },
+    "windows": {
+      "allowDowngrades": false,
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "languages": ["SimpChinese", "English"],
+        "installMode": "currentUser",
+        "displayLanguageSelector": false
+      }
+    }
   }
 }
