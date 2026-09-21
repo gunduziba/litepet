@@ -17,9 +17,50 @@ body {
 
 /* 图集视口：一格一格地移动 background-position。 */
 .pet {
-  width: 100%;
-  height: 100%;
+  position: absolute;
+  inset: 0;
   background-color: transparent;
   background-repeat: no-repeat;
   /* 不做 pixelated：多数素材是平滑绘制的，放大时保留插值更好看 */
+}
+
+/* 气泡：默认压在底部，不遮挡宠物上半身。
+   显隐与文案完全由 daemon 决定，这里不做任何计时。 */
+.bubble {
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  bottom: 4px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  background: rgba(24, 24, 28, 0.88);
+  color: #f4f4f5;
+  font: 12px/1.35 -apple-system, "PingFang SC", "Noto Sans CJK SC", sans-serif;
+  /* 长文本折行，但最多两行，超出截断（daemon 已按协议截到 48 字符） */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.bubble[hidden] {
+  display: none;
+}
+
+/* 类别配色：与 docs/PROTOCOL.md §6 的优先级顺序一致 */
+.bubble[data-kind="error"] {
+  background: rgba(153, 27, 27, 0.92);
+}
+
+.bubble[data-kind="warning"] {
+  background: rgba(146, 64, 14, 0.92);
+}
+
+.bubble[data-kind="success"] {
+  background: rgba(22, 101, 52, 0.92);
+}
+
+.bubble[data-kind="tool"] {
+  background: rgba(30, 58, 138, 0.88);
 }

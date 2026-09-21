@@ -1,20 +1,11 @@
-// 桌面宠物渲染层：按播放计划切图集，并响应 daemon 推来的状态事件。
+// 桌面宠物渲染层：按播放计划切图集，并渲染 daemon 推来的显示指令。
 //
-// 数据来源：Rust 侧 `pack_info` 命令（见 src/pack.rs）。
-// 状态语义与映射见 docs/PROTOCOL.md §4.4。
+// 数据来源：Rust 侧 `pack_info` 命令（见 src/pack.rs）与 Tauri 事件 `display`
+// （载荷为 `protocol::DisplayDirective`）。
+// 本层不做任何状态判断：动画名与气泡全由 daemon 决定（docs/PROTOCOL.md）。
 
 const { invoke } = window.__TAURI__.core;
 const { convertFileSrc } = window.__TAURI__.core;
-
-/** 语义状态 → 动画名的缺省映射（docs/PROTOCOL.md §4.4）。 */
-const STATE_TO_ANIMATION = {
-  idle: 'idle',
-  working: 'running',
-  resting: 'waiting',
-  'feedback.success': 'jumping',
-  'feedback.failure': 'failed',
-  disconnected: 'idle',
-};
 
 /** 当前宠物包信息（含 frame 网格与 animations 播放计划）。 */
 let pack = null;
@@ -90,12 +81,33 @@ function play(name) {
   schedule();
 }
 
-/** 订阅 daemon 推来的状态事件，映射成动画。 */
-async function watchStates() {
-  await window.__TAURI__.event.listen('state', (event) => {
-    const state = event.payload?.state;
-    play(STATE_TO_ANIMATION[state] ?? 'idle');
-  });
+/** 渲染一条气泡；`bubble` 为 `null` 时隐藏。 */
+function renderBubble(bubble) {
+  const el = document.getElementById('bubble');
+  if (!bubble) {
+    el.hidden = true;
+    return;
+  }
+  el.textContent = bubble.text;
+  el.dataset.kind = bubble.kind;
+  el.hidden = false;
+}
+
+/** 应用一条 DisplayDirective：先切动画，再渲染气泡。 */
+function apply(directive) {
+  if (!directive) return;
+  if (directive.animation) play(directive.animation);
+  renderBubble(directive.bubble);
+  // 回报给 daemon（仅用于日志验证：webview 的 console 在外面看不到）。
+  invoke('renderer_applied', {
+    animation: currentName,
+    bubble: directive.bubble?.text ?? null,
+  }).catch(() => {});
+}
+
+/** 订阅 daemon 推来的显示指令。 */
+async function watchDisplay() {
+  await window.__TAURI__.event.listen('display', (event) => apply(event.payload));
 }
 
 /** 启动：拉包信息、进入 idle、挂事件与 resize。 */
@@ -104,11 +116,18 @@ async function boot() {
   sheetUrl = convertFileSrc(pack.spritesheetPath);
   document.title = pack.displayName;
   window.addEventListener('resize', redraw);
-  // 调试入口：控制台可 __pet.play('waving')
-  window.__pet = { play, redraw, get pack() { return pack; } };
+  // 调试入口：控制台可 __pet.play('waving') / __pet.apply({animation:'idle'})
+  window.__pet = {
+    play,
+    redraw,
+    apply,
+    get pack() {
+      return pack;
+    },
+  };
   play('idle');
   await invoke('renderer_ready', { animations: Object.keys(pack.animations).length });
-  await watchStates();
+  await watchDisplay();
 }
 
 boot().catch((err) => console.error('pet-daemon: 渲染层启动失败', err));

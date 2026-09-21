@@ -15,6 +15,11 @@ const DEFAULT_HOME_DIR: &str = ".litepet";
 const CONFIG_FILE: &str = "config.json";
 /// 宠物包子目录名。
 const PETS_DIR: &str = "pets";
+/// socket 文件名。
+///
+/// 与 `config.json`／`pets/` 同处家目录（`SPEC.md` §传输）：受 `LITEPET_HOME` 控制，
+/// 路径长度远低于 macOS 的 104 字节 `sun_path` 上限，也不受 `$TMPDIR` 清理影响。
+const SOCKET_FILE: &str = "daemon.sock";
 /// 默认窗口边长（像素）。
 const DEFAULT_SIZE: u32 = 220;
 
@@ -80,6 +85,11 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(CONFIG_FILE))
 }
 
+/// daemon 的 Unix socket 路径 `~/.litepet/daemon.sock`。
+pub fn socket_path() -> Result<PathBuf> {
+    Ok(home_dir()?.join(SOCKET_FILE))
+}
+
 /// 读取配置；文件不存在时创建家目录并写入默认配置。
 ///
 /// 返回 (配置, 是否为新建)。
@@ -112,4 +122,26 @@ pub fn save(cfg: &Config) -> Result<()> {
     let body = serde_json::to_string_pretty(cfg).context("序列化配置失败")?;
     fs::write(&path, body).with_context(|| format!("写入配置失败：{}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 三个路径都必须落在同一个家目录下。
+    #[test]
+    fn paths_share_one_home() {
+        let home = home_dir().expect("应能定位家目录");
+        assert_eq!(pets_dir().expect("pets"), home.join("pets"));
+        assert_eq!(config_path().expect("config"), home.join("config.json"));
+        assert_eq!(socket_path().expect("socket"), home.join("daemon.sock"));
+    }
+
+    /// socket 路径必须短于 macOS `sun_path` 的 104 字节上限。
+    #[test]
+    fn socket_path_fits_sun_path() {
+        let path = socket_path().expect("应能定位 socket");
+        let bytes = path.as_os_str().as_encoded_bytes().len();
+        assert!(bytes < 104, "路径长 {bytes} 字节，超出 sun_path 上限：{path:?}");
+    }
 }

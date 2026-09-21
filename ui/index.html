@@ -9,6 +9,8 @@
   <body>
     <!-- 图集视口：整屏只有一个元素，靠 background-position 切到当前帧 -->
     <div id="pet" class="pet" role="img" aria-label="桌面宠物"></div>
+    <!-- 气泡：内容与显隐完全由 daemon 推来的 DisplayDirective 决定 -->
+    <div id="bubble" class="bubble" role="status" data-kind="info" hidden></div>
     <script src="pet.js"></script>
   </body>
 </html>
