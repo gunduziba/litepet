@@ -58,15 +58,51 @@ struct RowTiming {
 /// 时长取自 Codex `default_animations()` 的 `Duration` 值；`idle` 另有非均匀时长，
 /// 由 [`idle_animation`] 单独构造。
 const V1_ROW_TIMINGS: [RowTiming; 9] = [
-    RowTiming { frames: 6, frame_ms: 660, last_ms: 1920 },
-    RowTiming { frames: 8, frame_ms: 120, last_ms: 220 },
-    RowTiming { frames: 8, frame_ms: 120, last_ms: 220 },
-    RowTiming { frames: 4, frame_ms: 140, last_ms: 280 },
-    RowTiming { frames: 5, frame_ms: 140, last_ms: 280 },
-    RowTiming { frames: 8, frame_ms: 140, last_ms: 240 },
-    RowTiming { frames: 6, frame_ms: 150, last_ms: 260 },
-    RowTiming { frames: 6, frame_ms: 120, last_ms: 220 },
-    RowTiming { frames: 6, frame_ms: 150, last_ms: 280 },
+    RowTiming {
+        frames: 6,
+        frame_ms: 660,
+        last_ms: 1920,
+    },
+    RowTiming {
+        frames: 8,
+        frame_ms: 120,
+        last_ms: 220,
+    },
+    RowTiming {
+        frames: 8,
+        frame_ms: 120,
+        last_ms: 220,
+    },
+    RowTiming {
+        frames: 4,
+        frame_ms: 140,
+        last_ms: 280,
+    },
+    RowTiming {
+        frames: 5,
+        frame_ms: 140,
+        last_ms: 280,
+    },
+    RowTiming {
+        frames: 8,
+        frame_ms: 140,
+        last_ms: 240,
+    },
+    RowTiming {
+        frames: 6,
+        frame_ms: 150,
+        last_ms: 260,
+    },
+    RowTiming {
+        frames: 6,
+        frame_ms: 120,
+        last_ms: 220,
+    },
+    RowTiming {
+        frames: 6,
+        frame_ms: 150,
+        last_ms: 280,
+    },
 ];
 
 /// `idle` 的非均匀帧时长（毫秒）——刻意不均等，使其看起来像「偶尔动一下」。
@@ -234,7 +270,6 @@ fn resolve_grid(frame: Option<FrameSpec>, version: Option<u32>) -> Result<GridSp
 /// 按网格构造默认动画表（行名 → 帧序列）。
 fn build_animations(grid: GridSpec, version: Option<u32>) -> HashMap<String, AnimationPlan> {
     let mut map = HashMap::new();
-    let count = if version == Some(2) { V2_EXTRA_ROW_NAMES.len() } else { 0 };
 
     for (row, name) in V1_ROW_NAMES.iter().enumerate() {
         let plan = if row == 0 {
@@ -244,11 +279,14 @@ fn build_animations(grid: GridSpec, version: Option<u32>) -> HashMap<String, Ani
         };
         map.insert((*name).to_string(), plan);
     }
-    for i in 0..count {
-        let row = V1_ROW_NAMES.len() + i;
-        // V2 追加行的时长沿用 idle，源码未确证
-        let plan = loop_animation(grid, row, &V1_ROW_TIMINGS[0]);
-        map.insert(V2_EXTRA_ROW_NAMES[i].to_string(), plan);
+    // 追加行只存在于 V2
+    if version == Some(2) {
+        for (i, name) in V2_EXTRA_ROW_NAMES.iter().enumerate() {
+            let row = V1_ROW_NAMES.len() + i;
+            // V2 追加行的时长沿用 idle，源码未确证
+            let plan = loop_animation(grid, row, &V1_ROW_TIMINGS[0]);
+            map.insert((*name).to_string(), plan);
+        }
     }
     map
 }
@@ -302,7 +340,11 @@ fn action_animation(grid: GridSpec, row: usize, timing: &RowTiming) -> Animation
             let is_last = col + 1 == timing.frames as usize;
             frames.push(FramePlan {
                 sprite_index: sprite_index(grid, row, col),
-                duration_ms: if is_last { timing.last_ms } else { timing.frame_ms },
+                duration_ms: if is_last {
+                    timing.last_ms
+                } else {
+                    timing.frame_ms
+                },
             });
         }
     }
@@ -313,5 +355,151 @@ fn action_animation(grid: GridSpec, row: usize, timing: &RowTiming) -> Animation
         frames,
         loop_start: Some(loop_start),
         fallback: idle.fallback,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 真实 xunjian-miao 图集尺寸。
+    const REAL_ATLAS_W: u32 = 1536;
+    const REAL_ATLAS_H: u32 = 2288;
+    /// Codex 二进制中出现的 V1 图集高度常量（9 行 × 208）。
+    const CODEX_V1_ATLAS_H: u32 = 1872;
+    /// `idle` 帧序长度。
+    const IDLE_FRAME_COUNT: usize = 6;
+    /// 动作重复遍数，与 [`action_animation`] 内一致。
+    const REPEATS: usize = 3;
+
+    /// V2 网格必须能整除真实图集：8 列 × 11 行 × 192 × 208。
+    #[test]
+    fn v2_grid_divides_real_atlas() {
+        let grid = resolve_grid(None, Some(2)).expect("V2 网格应解析成功");
+        assert_eq!(grid.rows, V2_FRAME_ROWS);
+        assert_eq!(grid.columns * grid.width, REAL_ATLAS_W);
+        assert_eq!(grid.rows * grid.height, REAL_ATLAS_H);
+    }
+
+    /// V1 网格高度应为 Codex 二进制里出现的 1872。
+    #[test]
+    fn v1_grid_height_matches_codex_constant() {
+        for version in [None, Some(1)] {
+            let grid = resolve_grid(None, version).expect("V1 网格应解析成功");
+            assert_eq!(grid.rows, DEFAULT_FRAME_ROWS);
+            assert_eq!(grid.rows * grid.height, CODEX_V1_ATLAS_H);
+        }
+    }
+
+    /// 显式 `frame` 优先于 `spriteVersionNumber`。
+    #[test]
+    fn explicit_frame_wins_over_version() {
+        let frame = FrameSpec {
+            width: 100,
+            height: 50,
+            columns: 4,
+            rows: 3,
+        };
+        let grid = resolve_grid(Some(frame), Some(2)).expect("显式 frame 应优先");
+        assert_eq!(
+            (grid.width, grid.height, grid.columns, grid.rows),
+            (100, 50, 4, 3)
+        );
+    }
+
+    /// 任一网格维度为 0 都应被拒。
+    #[test]
+    fn zero_dimension_is_rejected() {
+        let frame = FrameSpec {
+            width: 192,
+            height: 0,
+            columns: 8,
+            rows: 9,
+        };
+        assert!(resolve_grid(Some(frame), None).is_err());
+    }
+
+    /// 未知的 `spriteVersionNumber` 应被拒。
+    #[test]
+    fn unknown_version_is_rejected() {
+        assert!(resolve_grid(None, Some(3)).is_err());
+    }
+
+    /// 九个 V1 行名齐备，且索引落在第 0 行内。
+    #[test]
+    fn v1_rows_all_present() {
+        let grid = resolve_grid(None, Some(1)).expect("网格应解析成功");
+        let anims = build_animations(grid, Some(1));
+        assert_eq!(anims.len(), V1_ROW_NAMES.len());
+        for name in V1_ROW_NAMES {
+            assert!(anims.contains_key(name), "缺少动画 {name}");
+        }
+        // idle 占第 0 行，索引必然小于列数
+        let idle = &anims["idle"];
+        assert_eq!(idle.frames.len(), IDLE_FRAME_COUNT);
+        assert!(idle
+            .frames
+            .iter()
+            .all(|f| f.sprite_index < grid.columns as usize));
+    }
+
+    /// V2 在 V1 基础上多出两行，行号落在 9 与 10。
+    #[test]
+    fn v2_adds_two_rows_at_bottom() {
+        let grid = resolve_grid(None, Some(2)).expect("V2 网格应解析成功");
+        let anims = build_animations(grid, Some(2));
+        assert_eq!(anims.len(), V1_ROW_NAMES.len() + V2_EXTRA_ROW_NAMES.len());
+        for (i, name) in V2_EXTRA_ROW_NAMES.iter().enumerate() {
+            let row = V1_ROW_NAMES.len() + i;
+            let base = row * grid.columns as usize;
+            let plan = &anims[*name];
+            assert!(plan.frames.iter().all(|f| f.sprite_index >= base));
+            assert!(plan
+                .frames
+                .iter()
+                .all(|f| f.sprite_index < base + grid.columns as usize));
+        }
+    }
+
+    /// 动作动画：主序列重复 3 遍 + idle 帧，循环点落在 idle 段开头。
+    #[test]
+    fn action_animation_loops_at_idle_segment() {
+        let grid = resolve_grid(None, Some(1)).expect("网格应解析成功");
+        let plan = action_animation(grid, 1, &V1_ROW_TIMINGS[1]);
+        let primary = V1_ROW_TIMINGS[1].frames as usize * REPEATS;
+        assert_eq!(plan.loop_start, Some(primary));
+        assert_eq!(plan.frames.len(), primary + IDLE_FRAME_COUNT);
+        assert_eq!(plan.fallback, "idle");
+    }
+
+    /// 一次性与循环动画的 fallback 都指向 idle。
+    #[test]
+    fn idle_loops_from_zero() {
+        let grid = resolve_grid(None, Some(1)).expect("网格应解析成功");
+        let plan = idle_animation(grid);
+        assert_eq!(plan.loop_start, Some(0));
+        assert_eq!(plan.fallback, "idle");
+    }
+
+    /// `spritesheetPath` 逃出宠物目录时必须被拒（不可信输入）。
+    #[test]
+    fn spritesheet_escaping_pack_dir_is_rejected() {
+        let root = std::env::temp_dir().join("pet-daemon-test-escape");
+        let _ = std::fs::remove_dir_all(&root);
+        let pet = root.join("pets").join("evil");
+        std::fs::create_dir_all(&pet).expect("建目录失败");
+        std::fs::write(root.join("outside.webp"), b"x").expect("写外部文件失败");
+        std::fs::write(
+            pet.join(PET_FILE),
+            r#"{"spritesheetPath": "../../outside.webp"}"#,
+        )
+        .expect("写清单失败");
+
+        let err = load(&root.join("pets"), "evil").expect_err("越界路径应被拒");
+        assert!(
+            format!("{err}").contains("越出宠物目录"),
+            "错误信息应指出越界，实际为 {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
