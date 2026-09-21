@@ -186,6 +186,23 @@ for (const name of readdirSync(join(root, 'ui')).filter((file) => file.endsWith(
 vm.runInContext(code, sandbox, { filename: scriptPath });
 await settle();
 
+// 第 3 项：窗口拖动。tauri 那边分两步看，缺一步就是「按住拖不动」：
+// `ui/index.html` 的 `<body>` 上没有 `data-tauri-drag-region`，前端根本不把这块当拖拽区；
+// capabilities 里没有 `core:window:allow-start-dragging`，认出来了也会被 ACL 拒掉。
+// 一个在 HTML、一个在 JSON，改一边忘一边是最容易发生的事，所以在这里对着验。
+const bodyTag = readFileSync(join(root, 'ui', 'index.html'), 'utf8').match(/<body[^>]*>/)?.[0] ?? '';
+check(
+  /data-tauri-drag-region/.test(bodyTag),
+  'ui/index.html 的 <body> 少了 data-tauri-drag-region——窗口拖不动',
+);
+const permissions = JSON.parse(
+  readFileSync(join(root, 'capabilities', 'default.json'), 'utf8'),
+).permissions;
+check(
+  permissions.includes('core:window:allow-start-dragging'),
+  'capabilities/default.json 少了 core:window:allow-start-dragging——拖拽会被 ACL 拒掉',
+);
+
 // 1. 页面不能把错误吞进状态条——这正是「设置页加载失败：TypeError」的落点。
 const status = registry.get('status');
 check(
