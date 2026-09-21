@@ -1,0 +1,43 @@
+pet-daemon
+Copyright 2026 pet-daemon contributors
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License in the LICENSE file distributed with this work, or at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+================================================================================
+THIRD-PARTY SOFTWARE
+================================================================================
+
+This product includes, derives from, or distributes the following third-party
+software. Each component remains under its own license.
+
+--------------------------------------------------------------------------------
+Open Vetta
+--------------------------------------------------------------------------------
+Copyright 2026 Vetta
+Source:  https://github.com/openvetta/open-vetta
+License: Apache-2.0
+
+The desktop-pet implementation of this project (action data model, session
+event to action policy, mouse-poll click-through strategy, widget bounds
+layout, bubble constants) is derived from Open Vetta's desktop app
+(`apps/desktop/src/main/pet/`, `apps/desktop/src/shared/pet-*`,
+`apps/desktop/src/renderer/domains/pet/`).
+
+The stoat (白鼬) webm animations under `assets/pet/` are original Open Vetta
+repository content and are redistributed here under Apache-2.0. They are NOT
+listed as third-party material in Open Vetta's NOTICE.
+
+Apache License 2.0 terms are reproduced in the LICENSE file of this project.
+
+--------------------------------------------------------------------------------
+pi (pi-mono)
+--------------------------------------------------------------------------------
+Copyright (c) Mario Zechner
+Source:  https://github.com/badlogic/pi-mono
+License: MIT
+
+The `adapters/pi` extension targets the pi coding agent extension API.
