@@ -361,6 +361,14 @@ impl Session {
         now: Instant,
     ) -> Result<Value, ErrorObject> {
         self.transient_play(&msg.host, rules.as_ref(), now);
+        if msg.kind == protocol::BubbleKind::Unknown {
+            // 降级显示而不是拒绝（协议前向兼容），但必须留痕：
+            // 适配器作者在对面看不到任何报错，这条日志是唯一的排错线索。
+            println!(
+                "pet-daemon: 宿主 {} 发来未知气泡类别，按最低优先级显示：{}",
+                msg.host, msg.text
+            );
+        }
         self.arbiter
             .on_bubble(&msg.host, msg.kind, &msg.text, msg.ttl_ms, now);
         Ok(Value::Null)
@@ -583,12 +591,42 @@ mod tests {
         let err = call(&mut session, protocol::method::HOST_HELLO, json!({}), now)
             .expect_err("缺 host 应被判为参数非法");
         assert_eq!(err.code, INVALID_PARAMS);
-        // kind 非法：枚举反序列化失败，同样归为参数非法。
         send(&mut session, protocol::method::HOST_HELLO, hello("pi"), now);
-        let bad = json!({ "host": "pi", "kind": "panic", "text": "x" });
-        let err = call(&mut session, protocol::method::PET_BUBBLE, bad, now)
-            .expect_err("非法 kind 应被判为参数非法");
+        // 缺 text：必需字段。
+        let err = call(
+            &mut session,
+            protocol::method::PET_BUBBLE,
+            json!({ "host": "pi", "kind": "info" }),
+            now,
+        )
+        .expect_err("缺 text 应被判为参数非法");
         assert_eq!(err.code, INVALID_PARAMS);
+        // text 类型错：同样归为参数非法。
+        let err = call(
+            &mut session,
+            protocol::method::PET_BUBBLE,
+            json!({ "host": "pi", "kind": "info", "text": 42 }),
+            now,
+        )
+        .expect_err("text 为数字应被判为参数非法");
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[test]
+    fn unknown_bubble_kind_is_shown_rather_than_rejected() {
+        // 适配器独立演进：新 kind 必须能被接住，不能因未知而整条丢掉。
+        let now = Instant::now();
+        let mut session = session();
+        send(&mut session, protocol::method::HOST_HELLO, hello("pi"), now);
+        let bad = json!({ "host": "pi", "kind": "celebrate", "text": "交卷" });
+        let answered = call(&mut session, protocol::method::PET_BUBBLE, bad, now)
+            .expect("未知 kind 不应被拒");
+        let Outcome::Display(directive) = answered.outcome else {
+            panic!("应推一条显示指令");
+        };
+        let bubble = directive.bubble.expect("应带气泡");
+        assert_eq!(bubble.kind, "unknown");
+        assert!(bubble.text.contains("交卷"), "正文应保留：{}", bubble.text);
     }
 
     #[test]

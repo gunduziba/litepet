@@ -313,6 +313,14 @@ fn parse_rules(
         if rule.on.trim().is_empty() {
             bail!("behavior.rules 存在空的 on 字段");
         }
+        if let Some(bubble) = rule.bubble.as_ref() {
+            // 线格式允许未知类别（适配器可能先于 daemon 引入），但**包配置不允许**：
+            // 规则里的 kind 是「声明」，拼错就该在加载期报错，而不是留一条永远只能
+            // 降级显示、看起来却像没问题的规则（docs/PET-PACK.md §0.1）。
+            if bubble.kind == BubbleKind::Unknown {
+                bail!("规则 {on} 的 bubble.kind 不是已知类别", on = rule.on);
+            }
+        }
         let Some(target) = rule.play.as_deref() else {
             continue;
         };
@@ -536,6 +544,17 @@ mod tests {
         });
         let err = Behavior::new(Some(&petdaemon(behavior)), &known()).expect_err("应被拒");
         assert!(format!("{err}").contains("不存在的组"), "实际为 {err}");
+    }
+
+    #[test]
+    fn unknown_bubble_kind_in_rules_is_rejected() {
+        // 线格式对未知 kind 是降级兼容，包配置则必须硬拒：
+        // 前者是别人的新版本，后者是自己写的声明，拼错不能静默。
+        let behavior = json!({
+            "rules": [{ "on": "agent.start", "bubble": { "kind": "celebrate", "text": "交卷" } }]
+        });
+        let err = Behavior::new(Some(&petdaemon(behavior)), &known()).expect_err("应被拒");
+        assert!(format!("{err}").contains("不是已知类别"), "实际为 {err}");
     }
 
     #[test]

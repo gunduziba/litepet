@@ -123,13 +123,28 @@ daemon 在**端口绑定成功之后**写出端点文件，宿主读它拿端口
 | `agent/end` | 通知 | `success: boolean`, `sessionId?: string` | 该宿主的 agent 结束 |
 | `tool/start` | 通知 | `toolName: string`, `bubble?: string` | 工具开始；`bubble` 为可选展示文本，**建议 ≤ 48 字符**，超长由 daemon 截断 |
 | `tool/end` | 通知 | `toolName: string`, `isError?: boolean` | 工具结束 |
-| `pet/bubble` | 通知 | `kind: "info"\|"status"\|"tool"\|"success"\|"warning"\|"error"`, `text: string`, `ttlMs?: number` | 直接发一条气泡 |
+| `pet/bubble` | 通知 | `kind: "info"\|"status"\|"tool"\|"success"\|"warning"\|"error"`（未知值降级，见下）, `text: string`, `ttlMs?: number` | 直接发一条气泡 |
 | `daemon/ping` | 请求 | `ts: number`（epoch ms） | 心跳，建议 20s 一次 |
 | `daemon/info` | 请求 | — | 查询 daemon 现状（调试与适配器自检用） |
 
 - `sessionId` 仅用于日志，daemon 不做多会话区分（每宿主一个状态机）
 - 未 `host/hello` 就发事件：通知被静默忽略，请求回 `-32001`
 - `protocolVersion` **高于** daemon 支持（当前 `1`）→ `-32002`，该宿主不注册；**低于**则接受（前向兼容）
+
+### 4.1 适配器独立演进产生的容错（v1 已实现）
+
+适配器独立于 daemon 发版，所以 daemon **必须能接住它没见过的输入**：
+
+| 输入 | 行为 |
+|---|---|
+| 未知 `method`（通知） | 静默忽略 |
+| 未知 `method`（请求） | `-32601` |
+| 未知 `params` 字段 | 忽略，不报错（未开 `deny_unknown_fields`） |
+| 未知 `bubble.kind` | **不拒绝**，降级为最低优先级、不着色的普通气泡（daemon 回传 `kind: "unknown"`），并记一条 daemon 日志 |
+| 缺必需字段 / 类型错 | `-32602`；若为通知则只记 daemon 日志（无回复通道） |
+
+> 未知 `kind` 不拒绝是刻意的：`pet/bubble` 是通知，拒了它适配器作者只会看到「什么也没发生」。
+> 但同一个未知 `kind` 写在**包配置** `petdaemon.behavior` 里是**加载期硬拒**的——线格式是别人的新版本，包配置是自己的声明，拼错不能静默。
 
 ## 5. daemon → 宿主
 
@@ -178,7 +193,7 @@ idle ──agent.start──► working ──agent.end(success)──► celebr
 - `ttlMs` 默认 `4000`，下限 `500`，上限 `30000`
 - 去重键：`tool/start` 的气泡用 `toolName` 作 dedupeKey，同键在 TTL 内不重发
 - 正文截断 48 字符，详情截断 120 字符，超出部分以 `…` 结尾
-- 气泡优先级：`error` > `warning` > `success` > `tool` > `status` > `info`；低优先级不抢占未过期的更高优先级气泡
+- 气泡优先级：`error` > `warning` > `success` > `tool` > `status` > `info` > `unknown`；低优先级不抢占未过期的更高优先级气泡
 - 气泡放置：默认宠物上方；宠物贴屏幕顶边（≤ 8px slack）时翻到下方
 
 ## 7. 心跳与注销

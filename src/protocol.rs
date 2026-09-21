@@ -178,9 +178,17 @@ pub struct PingParams {
 }
 
 /// 气泡语义类别；`Ord` 即优先级，越大越优先（`docs/PROTOCOL.md` §6）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BubbleKind {
+    /// 本版本不认识的类别。
+    ///
+    /// **这个变体是必要的**：宿主适配器独立于 daemon 演进，可能先于 daemon 引入新类别。
+    /// 若直接拒绝，一条 `kind: "celebrate"` 的 `pet/bubble` 整条会被回 `-32602`，
+    /// 而通知没有回复通道——适配器作者只会看到「什么也没发生」。
+    ///
+    /// 排序放在最前，即优先级最低：看不懂的语义不该抢屏。
+    /// （原始字符串不保留：保留会失去 `Copy`，而报错处已经能指明是哪条规则/哪个工具）
+    Unknown,
     /// 普通信息。
     Info,
     /// 状态变更。
@@ -196,9 +204,26 @@ pub enum BubbleKind {
 }
 
 impl BubbleKind {
+    /// 线格式名字 → 类别；认不出的一律退化成 [`BubbleKind::Unknown`]。
+    pub fn from_wire(raw: &str) -> Self {
+        match raw {
+            "info" => Self::Info,
+            "status" => Self::Status,
+            "tool" => Self::Tool,
+            "success" => Self::Success,
+            "warning" => Self::Warning,
+            "error" => Self::Error,
+            _ => Self::Unknown,
+        }
+    }
+
     /// 线格式里的小写名字，用于回传渲染层。
+    ///
+    /// 渲染层对 `"unknown"` 没有专门样式，会落到 `.bubble` 的基础样式上，
+    /// 效果即「不着色的普通气泡」。
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Unknown => "unknown",
             Self::Info => "info",
             Self::Status => "status",
             Self::Tool => "tool",
@@ -206,6 +231,19 @@ impl BubbleKind {
             Self::Warning => "warning",
             Self::Error => "error",
         }
+    }
+}
+
+/// 手写而非 derive：需要未知值退化而不是报错，见 [`BubbleKind::Unknown`]。
+///
+/// （serde 的 `#[serde(other)]` 只能用于内部/相邻标记的枚举，对本枚举无效。）
+impl<'de> Deserialize<'de> for BubbleKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::from_wire(&raw))
     }
 }
 
@@ -311,13 +349,21 @@ mod tests {
     }
 
     #[test]
-    fn bubble_kind_rejects_unknown_value() {
-        assert!(
-            serde_json::from_value::<PetBubble>(params(
-                r#"{"host":"pi","kind":"panic","text":"x"}"#
-            ))
-            .is_err()
-        );
+    fn bubble_kind_degrades_instead_of_rejecting_unknown() {
+        // 适配器独立演进：新 kind 必须能被接住，否则整条通知被丢且适配器无从得知。
+        let msg: PetBubble = serde_json::from_value(params(
+            r#"{"host":"pi","kind":"celebrate","text":"交卷"}"#,
+        ))
+        .expect("未知 kind 不应导致整条消息解析失败");
+        assert_eq!(msg.kind, BubbleKind::Unknown);
+        assert_eq!(msg.kind.as_str(), "unknown");
+        assert_eq!(msg.text, "交卷", "气泡正文仍要保留");
+    }
+
+    #[test]
+    fn unknown_bubble_kind_has_lowest_priority() {
+        // 看不懂的语义不该抢屏。
+        assert!(BubbleKind::Info > BubbleKind::Unknown);
     }
 
     #[test]
