@@ -291,6 +291,31 @@ pub fn remove_endpoint() -> Result<()> {
     fs::remove_file(&path).with_context(|| format!("删除对接信息失败：{}", path.display()))
 }
 
+/// 删除对接信息，但**只在它确实指向 `port` 时**。
+///
+/// 退出清理必须带这个判断：`--port` 不同时允许多个实例同时跑，
+/// 否则先退出的那个会把还在跑的那个的对接文件删掉，宿主就再也找不到它了。
+pub fn remove_endpoint_for(port: u16) -> Result<()> {
+    let path = endpoint_path()?;
+    let Ok(body) = fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    // 文件坏了也不能删：它可能正是另一个实例写的，留给下一次启动自己覆盖。
+    let ours = endpoint_belongs_to(&body, port);
+    if !ours {
+        return Ok(());
+    }
+    fs::remove_file(&path).with_context(|| format!("删除对接信息失败：{}", path.display()))
+}
+
+/// 一份对接信息是否属于端口 `port`。
+///
+/// 读不了或字段不全都算「不属于」——宁可留着不删：
+/// 删错了会让另一个还在跑的实例从磁盘上消失，留着最多多覆盖一次。
+fn endpoint_belongs_to(body: &str, port: u16) -> bool {
+    serde_json::from_str::<Endpoint>(body).is_ok_and(|endpoint| endpoint.port == port)
+}
+
 /// 生成一个 128 位随机 token（32 位小写十六进制）。
 ///
 /// 复用依赖树里已有的 `getrandom`，不自造随机数。
@@ -432,6 +457,27 @@ mod tests {
         assert_eq!(config_path().expect("config"), home.join("config.json"));
         assert_eq!(endpoint_path().expect("endpoint"), home.join("daemon.json"));
         assert_eq!(logs_dir().expect("logs"), home.join("logs"));
+    }
+
+    /// 退出清理只能删自己写的对接信息。
+    ///
+    /// `--port` 不同时允许多个实例同时跑，删错了会让另一个实例从磁盘上消失。
+    #[test]
+    fn endpoint_ownership_is_by_port() {
+        let body = r#"{"protocolVersion":1,"port":4590,"token":"ab"}"#;
+        assert!(endpoint_belongs_to(body, 4590), "同端口应当认领");
+        assert!(!endpoint_belongs_to(body, 4591), "别的实例的文件不能删");
+    }
+
+    /// 对接信息读不了时一律不认领。删掉它风险更大：它可能正是另一个实例写的。
+    #[test]
+    fn endpoint_ownership_rejects_unreadable_file() {
+        assert!(!endpoint_belongs_to("", 4590));
+        assert!(!endpoint_belongs_to("不是 JSON", 4590));
+        assert!(
+            !endpoint_belongs_to(r#"{"port":4590}"#, 4590),
+            "缺字段不算自己的"
+        );
     }
 
     /// 旧的配置文件里没有 `notify` 段，读出来必须是一份可用的默认值。

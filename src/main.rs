@@ -33,6 +33,7 @@ mod session;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -718,11 +719,17 @@ fn main() {
     if resident {
         log::info!("常驻模式，全部宿主断开后不退出");
     }
-    tauri::Builder::default()
+    // 监听端口在 `setup` 里才定下来（要读配置），但退出回调在主线程上跑，
+    // 两者之间只能靠一个共享值传递。
+    let bound_port = Arc::new(AtomicU16::new(0));
+    let port_shared = Arc::clone(&bound_port);
+    let app = tauri::Builder::default()
         .setup(move |app| {
             let (state, configured_port) = init_pet();
             // 命令行优先于配置文件。
             let port = port.unwrap_or(configured_port);
+            // 留给退出清理：它得知道对接文件里那个端口是不是自己写的。
+            port_shared.store(port, Ordering::Relaxed);
             // `start_http` 内部会 `manage` 那个共享句柄，所以得先拿到 `&state`。
             start_http(app.handle().clone(), &state, port, resident);
             app.manage(state);
@@ -734,6 +741,29 @@ fn main() {
             renderer_applied,
             local_call
         ])
-        .run(tauri::generate_context!())
-        .expect("Tauri 应用启动失败");
+        .build(tauri::generate_context!());
+    let app = match app {
+        Ok(app) => app,
+        Err(err) => {
+            // 走 `.expect` 的话这里会 panic，而 panic 不跑退出清理——端点文件会留在
+            // 磁盘上指着一个根本不存在的端口，下次启动和宿主探测都会被它骗到。
+            eprintln!("litepet: 界面初始化失败：{err}");
+            log::error!("界面初始化失败：{err}");
+            if let Err(err) = config::remove_endpoint() {
+                log::warn!("清理对接信息失败：{err:#}");
+            }
+            std::process::exit(1);
+        }
+    };
+    app.run(move |_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            let port = bound_port.load(Ordering::Relaxed);
+            if port != 0 {
+                match config::remove_endpoint_for(port) {
+                    Ok(()) => log::info!("退出：已清理对接信息"),
+                    Err(err) => log::warn!("退出时清理对接信息失败：{err:#}"),
+                }
+            }
+        }
+    });
 }
