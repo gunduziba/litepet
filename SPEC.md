@@ -230,6 +230,12 @@ Vetta 原素材是 8 个 VP9 + alpha 的 webm（302 帧 / 10.066s / 30fps / 576�
 - 右键菜单：动作切换 / 置顶开关 / 退出
 - 位置与大小持久化：daemon 侧 JSON 配置文件（**`~/.litepet/config.json`**，家目录约定见 `docs/PET-PACK.md` §2）
 
+**已完成：拖拽移动 + 位置持久化。** 两条都是「只做一半就不生效」的坑：
+
+- **拖拽**分两处在 tauri 里：`ui/index.html` 的 `<body>` 要带 `data-tauri-drag-region="deep"`（`deep` 表示子树里任意点击都算拖拽区；本窗口能接住点击的是盖满窗口的 `#pet`，裸写属性只对直接点多那个元素生效），tauri 再转成 `plugin:window|start_dragging` —— 所以 `capabilities/default.json` 必须授 `core:window:allow-start-dragging`，缺一条就是「按住拖不动」。`scripts/check-ui.mjs` 会把这两处对起来验。
+- **位置持久化**：`WindowEvent::Moved` 的坐标合并后写回 `config.json` 的 `x`/`y`（拖动中每秒几十条，落定 300 ms 才写一次），启动时按它摆窗口。
+- ⚠️ **单位坑（实测）**：`Moved` / `outer_position()` 给的是**物理**坐标，但 `set_position(Physical(_))` 会先按 `window.scale_factor()` 换回逻辑坐标，而这个读在窗口刚建好时是 1.0（Retina 真值 2.0）——请求物理 300 会落到物理 600，写回 600 后下次启动再翻一倍，几轮后窗口飞出屏幕。所以恢复位置走 `LogicalPosition(x / 显示器缩放率, ...)`：这条路不做换算，缩放率也从显示器取（不依赖窗口是否已摆上屏幕）。
+
 ### 3.7 气泡（M5 打磨项）
 
 - 数据驱动换肤：Vetta 的气泡样式是 JSON（`apps/desktop/src/shared/pet-bubble-styles/*.json`，`surface` 用 Tailwind 类名 + `decor.corners` 四角 PNG）。MVP 先做 plain 样式，换肤 JSON 格式照搬，节日皮肤后续加
@@ -365,7 +371,7 @@ L3 是唯一能把 §3.4 「策略逻辑要手写 Rust」这条成本压下去�
 | M0 | 仓库初始化 + 本文档入库 + 协议 v1 定稿 | `docs/PROTOCOL.md` 与本文 §2 一致；CI（fmt/clippy/build）跑通 |
 | M1 | Tauri daemon：透明窗 + animated WebP 播放 + HTTP server + 状态机最小版 | `node scripts/host-sim.mjs` 演完整会话：宠物切打字动画 → 出气泡 → `agent/end` 后举杠铃 → 道别后 linger 30s 退出并删掉 `daemon.json`；二次启动检测单例 |
 | M2 | 协议层可被真实宿主驱动（本仓库只做到这一步） | `node scripts/host-sim.mjs` 演完整会话全部通过；“宿主侧适配器”已移出本仓库，另在独立仓库验收（`~/tools/litepet-adapter-ts`） |
-| M3 | 点击穿透 + 拖拽/缩放/右键菜单 + 位置持久化 | 宠物不挡下层点击；点中宠物可拖可缩；重启后位置保留 |
+| M3 | 点击穿透 + 拖拽/缩放/右键菜单 + 位置持久化 | 宠物不挡下层点击；点中宠物可拖可缩；重启后位置保留。**进度：拖拽移动与位置持久化已完成（实测重启后 (300,300) 仍落在 (300,300)、不漂移）；点击穿透、缩放、右键菜单未做** |
 | M4 | dsh 适配器（独立仓库） | 与 M2 同标准在 dsh 上验收；pi+dsh 同时跑时仲裁与徽章正确 |
 | M5 | 打磨：省电、气泡换肤 JSON、`--resident`、登录自启、dmg 打包 | 手工清单逐项过 |
 | M6 | 提醒层：规则表驱动的音效 / 系统通知 / 手机推送（§3.9） | 宿主发 `agent/settled` 时出声并弹通知；已配 Bark 时同一条规则也推手机；任一通道配错不影响其余两个 |
