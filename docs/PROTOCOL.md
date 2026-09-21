@@ -18,9 +18,10 @@ Unix domain socket，`SOCK_STREAM`，UTF-8，**JSONL 帧**（每帧一行，`\n`
 
 | 平台 | socket 路径 |
 |---|---|
-| macOS | `~/Library/Application Support/pet-daemon/daemon.sock` |
-| Linux | `$XDG_RUNTIME_DIR/pet-daemon.sock`，无 `XDG_RUNTIME_DIR` 时回退 `/tmp/pet-daemon-$UID.sock` |
+| macOS / Linux | `$LITEPET_HOME/daemon.sock`，`LITEPET_HOME` 未设时回退 `~/.litepet/daemon.sock` |
 | Windows（M5 后） | 命名管道 `\\.\pipe\pet-daemon` |
+
+路径与 `config.json`、`pets/` 同处一个家目录（`SPEC.md` §2.4），受 `LITEPET_HOME` 控制：Unix socket 路径长度上限 104 字节（macOS `sun_path`），家目录形式远低于上限，且不受 `$TMPDIR` 清理影响。**（旧版本文档写的是 `~/Library/Application Support/pet-daemon/daemon.sock` 与 `$XDG_RUNTIME_DIR`，已废弃。）**
 
 **单例锁**：socket 文件被占用（`bind` 报 `EADDRINUSE` 且能连通）即视为 daemon 已运行，新进程直接退出。
 
@@ -148,7 +149,8 @@ idle ──agent.start──► working ──agent.end(success)──► celebr
 |---|---|---|
 | `agent.start` | `working` 组默认 | `status`：开始工作 |
 | `tool.start` | 保持当前 | `tool`：`{toolName}` 或宿主给的 `bubble` 文本 |
-| `tool.end`(isError) | `feedback`：`stoat_wave_backflip_smoke_fade_exit` | `error` |
+| `tool.end`(isError) | `feedback`：`stoat_wave_backflip_smoke_fade_exit` | `error`：`{toolName}` |
+| `tool.end`（成功） | 保持当前 | **不出气泡**（`toolName` 是去重键，不是展示文本） |
 | `agent.end`(success) | `feedback`：`stoat_stand_lift_barbell_one_hand_fast` | `success`：任务完成 |
 | `agent.end`(fail) | `feedback`：`stoat_wave_backflip_smoke_fade_exit` | `info`：任务失败 |
 | 90s 无事件 | `resting` 组轮换 | — |
@@ -160,11 +162,17 @@ idle ──agent.start──► working ──agent.end(success)──► celebr
 ## 10. 手工验证
 
 ```bash
-SOCK="$HOME/Library/Application Support/pet-daemon/daemon.sock"
+SOCK="${LITEPET_HOME:-$HOME/.litepet}/daemon.sock"
 printf '%s\n' '{"v":1,"type":"host.hello","host":"test","pid":0}' | socat - UNIX-CONNECT:"$SOCK"
 printf '%s\n' '{"v":1,"type":"agent.start","host":"test"}'      | socat - UNIX-CONNECT:"$SOCK"
 printf '%s\n' '{"v":1,"type":"tool.start","host":"test","toolName":"bash","bubble":"跑测试"}' | socat - UNIX-CONNECT:"$SOCK"
 printf '%s\n' '{"v":1,"type":"agent.end","host":"test","success":true}' | socat - UNIX-CONNECT:"$SOCK"
+```
+
+也可以用仓库里的零依赖模拟器，它按顺序演完整会话并留出观察间隔：
+
+```bash
+node scripts/host-sim.mjs --host pi --step 800
 ```
 
 预期：切「打字」→ 出气泡 → 断开后 `agent.end` 举杠铃 → 连接关闭 → linger 30s 后 daemon 退出。
