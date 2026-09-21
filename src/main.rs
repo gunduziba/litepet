@@ -10,15 +10,16 @@ use std::path::Path;
 use std::sync::Mutex;
 use tauri::Manager;
 
-/// 已加载的宠物包，供渲染层读取。
-struct PetState(Mutex<Option<pack::PetInfo>>);
+/// 已加载的宠物包，供渲染层与行为模块读取。
+struct PetState(Mutex<Option<pack::LoadedPet>>);
 
 /// 渲染层启动时拉取宠物包信息。
 #[tauri::command]
 fn pack_info(state: tauri::State<'_, PetState>) -> std::result::Result<pack::PetInfo, String> {
     let guard = state.0.lock().map_err(|err| err.to_string())?;
     guard
-        .clone()
+        .as_ref()
+        .map(|loaded| loaded.info.clone())
         .ok_or_else(|| "宠物包尚未加载，请检查 ~/.litepet/pets".to_string())
 }
 
@@ -47,7 +48,7 @@ fn pick_pack(root: &Path, preferred: Option<&str>) -> Option<String> {
 }
 
 /// 读取配置并加载宠物包。
-fn try_init_pet() -> Result<pack::PetInfo> {
+fn try_init_pet() -> Result<pack::LoadedPet> {
     let (cfg, created) = config::load_or_init()?;
     if created {
         println!(
@@ -58,12 +59,23 @@ fn try_init_pet() -> Result<pack::PetInfo> {
     let root = config::pets_dir()?;
     let id = pick_pack(&root, cfg.pet.as_deref())
         .with_context(|| format!("{} 下没有可用宠物包（需含 pet.json）", root.display()))?;
-    let info = pack::load(&root, &id)?;
+    let loaded = pack::load(&root, &id)?;
     println!(
-        "pet-daemon: 已加载宠物包 {}（{}）",
-        info.id, info.display_name
+        "pet-daemon: 已加载宠物包 {}（{}），{} 个动画，网格 {}x{}x{}x{}",
+        loaded.info.id,
+        loaded.info.display_name,
+        loaded.info.animations.len(),
+        loaded.info.frame.width,
+        loaded.info.frame.height,
+        loaded.info.frame.columns,
+        loaded.info.frame.rows,
     );
-    Ok(info)
+    match loaded.behavior.as_ref().and_then(|b| b.get("behavior")) {
+        Some(_) => println!("pet-daemon: 已读取 petdaemon.behavior 扩展配置"),
+        // 纯 Codex 包没有这个键，此时全走 §4.4 降级映射
+        None => println!("pet-daemon: 无 petdaemon.behavior 扩展，使用 Codex 降级映射"),
+    }
+    Ok(loaded)
 }
 
 /// 加载失败只告警，不阻塞窗口启动。
