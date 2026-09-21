@@ -2,9 +2,9 @@
 //!
 //! 权威契约见 `docs/PET-PACK.md` §4。两条路径：
 //!
-//! - **规则表**（包里有 `petdaemon.behavior`）：按 `docs/PET-PACK.md` §4.3 求值，
+//! - **规则表**（包里有 `litepet.behavior`）：按 `docs/PET-PACK.md` §4.3 求值，
 //!   `on` 匹配协议事件 `type`，首个匹配的规则生效。
-//! - **Codex 降级**（纯 Codex 包，无 `petdaemon` 键）：走 §4.4 的常量映射表。
+//! - **Codex 降级**（纯 Codex 包，无 `litepet` 键）：走 §4.4 的常量映射表。
 //!
 //! 本模块不含 IO 与计时，全部可单测。
 
@@ -169,31 +169,29 @@ pub struct Behavior {
 }
 
 impl Behavior {
-    /// 从 `pet.json` 的 `petdaemon.behavior` 构造。
-    ///
-    /// 从 `pet.json` 的 `petdaemon` 扩展构造（`docs/PET-PACK.md` §4.2）。
+    /// 从 `pet.json` 的 `litepet` 扩展构造（`docs/PET-PACK.md` §4.2）。
     ///
     /// `known` 为该包实际声明的动画名集合，用于校验 `play` 与 `groups` 的引用。
-    /// 传 `None` 表示包里没有 `petdaemon` 键 → 走 Codex 降级。
-    pub fn new(petdaemon: Option<&Value>, known: &BTreeSet<String>) -> Result<Self> {
-        let Some(petdaemon) = petdaemon else {
+    /// 传 `None` 表示包里没有 `litepet` 键 → 走 Codex 降级。
+    pub fn new(litepet: Option<&Value>, known: &BTreeSet<String>) -> Result<Self> {
+        let Some(litepet) = litepet else {
             return Ok(Self {
                 mode: Mode::CodexFallback,
             });
         };
         // 前向兼容必须硬失败：v1 的 daemon 读不懂 v2 的 `behavior` 语义，
         // 静默按 v1 解释会出错包的动画，不如直接报错让用户升级。
-        let schema = petdaemon
+        let schema = litepet
             .get("schemaVersion")
             .and_then(Value::as_u64)
             .unwrap_or(SUPPORTED_SCHEMA_VERSION);
         if schema > SUPPORTED_SCHEMA_VERSION {
             bail!(
-                "petdaemon.schemaVersion={schema} 高于本 daemon 支持的 {SUPPORTED_SCHEMA_VERSION}，请升级 pet-daemon"
+                "litepet.schemaVersion={schema} 高于本 daemon 支持的 {SUPPORTED_SCHEMA_VERSION}，请升级 litepet"
             );
         }
-        // 有 `petdaemon` 但没有 `behavior`：仍是纯 Codex 包，走降级。
-        let Some(behavior) = petdaemon.get("behavior") else {
+        // 有 `litepet` 但没有 `behavior`：仍是纯 Codex 包，走降级。
+        let Some(behavior) = litepet.get("behavior") else {
             return Ok(Self {
                 mode: Mode::CodexFallback,
             });
@@ -418,8 +416,8 @@ mod tests {
             .collect()
     }
 
-    /// 把一段 `behavior` 配置包成完整的 `petdaemon` 扩展对象。
-    fn petdaemon(behavior: Value) -> Value {
+    /// 把一段 `behavior` 配置包成完整的 `litepet` 扩展对象。
+    fn litepet(behavior: Value) -> Value {
         json!({ "schemaVersion": 1, "behavior": behavior })
     }
 
@@ -443,7 +441,7 @@ mod tests {
                   "bubble": { "kind": "tool", "text": "{toolName}" } }
             ]
         });
-        Behavior::new(Some(&petdaemon(behavior)), &known()).expect("规则表应能解析")
+        Behavior::new(Some(&litepet(behavior)), &known()).expect("规则表应能解析")
     }
 
     #[test]
@@ -533,7 +531,7 @@ mod tests {
         let behavior = json!({
             "rules": [{ "on": "agent.start", "play": "nope" }]
         });
-        let err = Behavior::new(Some(&petdaemon(behavior)), &known()).expect_err("应被拒");
+        let err = Behavior::new(Some(&litepet(behavior)), &known()).expect_err("应被拒");
         assert!(format!("{err}").contains("nope"), "实际为 {err}");
     }
 
@@ -542,7 +540,7 @@ mod tests {
         let behavior = json!({
             "rules": [{ "on": "agent.start", "play": "group:nope" }]
         });
-        let err = Behavior::new(Some(&petdaemon(behavior)), &known()).expect_err("应被拒");
+        let err = Behavior::new(Some(&litepet(behavior)), &known()).expect_err("应被拒");
         assert!(format!("{err}").contains("不存在的组"), "实际为 {err}");
     }
 
@@ -553,21 +551,21 @@ mod tests {
         let behavior = json!({
             "rules": [{ "on": "agent.start", "bubble": { "kind": "celebrate", "text": "交卷" } }]
         });
-        let err = Behavior::new(Some(&petdaemon(behavior)), &known()).expect_err("应被拒");
+        let err = Behavior::new(Some(&litepet(behavior)), &known()).expect_err("应被拒");
         assert!(format!("{err}").contains("不是已知类别"), "实际为 {err}");
     }
 
     #[test]
     fn groups_referencing_missing_animation_are_rejected() {
         let behavior = json!({ "groups": { "idle": ["ghost"] } });
-        let err = Behavior::new(Some(&petdaemon(behavior)), &known()).expect_err("应被拒");
+        let err = Behavior::new(Some(&litepet(behavior)), &known()).expect_err("应被拒");
         assert!(format!("{err}").contains("ghost"), "实际为 {err}");
     }
 
     #[test]
     fn empty_idle_timeout_is_rejected() {
         let behavior = json!({ "idleTimeoutMs": 0 });
-        assert!(Behavior::new(Some(&petdaemon(behavior)), &known()).is_err());
+        assert!(Behavior::new(Some(&litepet(behavior)), &known()).is_err());
     }
 
     /// 未来版本的 `schemaVersion` 必须硬失败，不能按 v1 静默解释。
@@ -593,7 +591,7 @@ mod tests {
         assert!(Behavior::new(Some(&current), &known()).is_ok());
     }
 
-    /// 有 `petdaemon` 但无 `behavior`，仍应走 Codex 降级而不是报错。
+    /// 有 `litepet` 但无 `behavior`，仍应走 Codex 降级而不是报错。
     #[test]
     fn extension_without_behavior_falls_back() {
         let config = json!({ "schemaVersion": 1, "license": "MIT" });
@@ -606,7 +604,7 @@ mod tests {
         let behavior = json!({
             "rules": [{ "on": "tool.end", "when": { "isError": null }, "play": "sad" }]
         });
-        let behavior = Behavior::new(Some(&petdaemon(behavior)), &known()).expect("应能解析");
+        let behavior = Behavior::new(Some(&litepet(behavior)), &known()).expect("应能解析");
         assert_eq!(
             behavior.resolve(&Event::new("tool.end", json!({ "isError": true }))).play,
             Some(Play::Animation("sad".to_string()))

@@ -1,4 +1,4 @@
-//! pet-daemon 入口。
+//! litepet 入口。
 //!
 //! 架构与约束见 `SPEC.md`，宠物包契约见 `docs/PET-PACK.md`，通信协议见 `docs/PROTOCOL.md`。
 //!
@@ -51,7 +51,7 @@ fn pack_info(state: tauri::State<'_, PetState>) -> std::result::Result<pack::Pet
 /// 渲染层就绪握手：前端加载完宠物包后调用，便于确认宠物确实已上屏。
 #[tauri::command]
 fn renderer_ready(animations: usize) {
-    println!("pet-daemon: 渲染层就绪，可用动画 {animations} 个");
+    println!("litepet: 渲染层就绪，可用动画 {animations} 个");
 }
 
 /// 渲染层应用了一条指令后回报。
@@ -62,8 +62,8 @@ fn renderer_ready(animations: usize) {
 #[tauri::command]
 fn renderer_applied(animation: String, bubble: Option<String>) {
     match bubble {
-        Some(text) => println!("pet-daemon: 渲染层已应用 动画={animation} 气泡={text}"),
-        None => println!("pet-daemon: 渲染层已应用 动画={animation}"),
+        Some(text) => println!("litepet: 渲染层已应用 动画={animation} 气泡={text}"),
+        None => println!("litepet: 渲染层已应用 动画={animation}"),
     }
 }
 
@@ -73,7 +73,7 @@ fn pick_pack(root: &Path, preferred: Option<&str>) -> Option<String> {
         if root.join(id).join("pet.json").is_file() {
             return Some(id.to_string());
         }
-        eprintln!("pet-daemon: 配置的宠物包不可用，回退到自动挑选：{id}");
+        eprintln!("litepet: 配置的宠物包不可用，回退到自动挑选：{id}");
     }
     let mut ids: Vec<String> = std::fs::read_dir(root)
         .ok()?
@@ -90,7 +90,7 @@ fn try_init_pet() -> Result<(pack::LoadedPet, u16)> {
     let (cfg, created) = config::load_or_init()?;
     if created {
         println!(
-            "pet-daemon: 已初始化家目录 {}",
+            "litepet: 已初始化家目录 {}",
             config::home_dir()?.display()
         );
     }
@@ -99,7 +99,7 @@ fn try_init_pet() -> Result<(pack::LoadedPet, u16)> {
         .with_context(|| format!("{} 下没有可用宠物包（需含 pet.json）", root.display()))?;
     let loaded = pack::load(&root, &id)?;
     println!(
-        "pet-daemon: 已加载宠物包 {}（{}），{} 个动画，网格 {}x{}x{}x{}",
+        "litepet: 已加载宠物包 {}（{}），{} 个动画，网格 {}x{}x{}x{}",
         loaded.info.id,
         loaded.info.display_name,
         loaded.info.animations.len(),
@@ -109,9 +109,9 @@ fn try_init_pet() -> Result<(pack::LoadedPet, u16)> {
         loaded.info.frame.rows,
     );
     match loaded.behavior.as_ref().and_then(|value| value.get("behavior")) {
-        Some(_) => println!("pet-daemon: 已读取 petdaemon.behavior 扩展配置"),
+        Some(_) => println!("litepet: 已读取 litepet.behavior 扩展配置"),
         // 纯 Codex 包没有这个键，此时全走 §4.4 降级映射
-        None => println!("pet-daemon: 无 petdaemon.behavior 扩展，使用 Codex 降级映射"),
+        None => println!("litepet: 无 litepet.behavior 扩展，使用 Codex 降级映射"),
     }
     Ok((loaded, cfg.port))
 }
@@ -124,7 +124,7 @@ fn init_pet() -> (PetState, u16) {
     match try_init_pet() {
         Ok((loaded, port)) => (PetState(Mutex::new(Some(Arc::new(loaded)))), port),
         Err(err) => {
-            eprintln!("pet-daemon: 宠物包加载失败：{err:#}");
+            eprintln!("litepet: 宠物包加载失败：{err:#}");
             (PetState(Mutex::new(None)), config::DEFAULT_PORT)
         }
     }
@@ -138,51 +138,51 @@ fn start_http(app: tauri::AppHandle, loaded: &pack::LoadedPet, port: u16, reside
     let setup = session::Setup {
         pet_id: loaded.info.id.clone(),
         known: loaded.info.animations.keys().cloned().collect(),
-        petdaemon: loaded.behavior.clone(),
+        litepet: loaded.behavior.clone(),
         resident,
     };
     let session = match session::Session::new(setup) {
         Ok(session) => session,
         Err(err) => {
-            eprintln!("pet-daemon: 行为配置非法，HTTP 服务未启动：{err:#}");
+            eprintln!("litepet: 行为配置非法，HTTP 服务未启动：{err:#}");
             return;
         }
     };
     if !session.has_rules() {
-        println!("pet-daemon: 该包无规则表，动画由 Codex 降级映射决定");
+        println!("litepet: 该包无规则表，动画由 Codex 降级映射决定");
     }
 
     // 先占端口再写对接信息：绑定失败就别留下一个指向死端口的文件。
     let server = match http::listen(port) {
         Ok(server) => server,
         Err(err) => {
-            eprintln!("pet-daemon: {err:#}");
+            eprintln!("litepet: {err:#}");
             // 单例是硬性约束（SPEC §0 约束 2）：没抢到端口就不能再开一只宠物。
             // 如果只是打条日志就继续跑，结果是一个永远收不到任何事件的僵尸窗口，
             // 而且它看起来和正常实例一模一样，最难排查。所以这里必须退出。
             if http::instance_running(port) {
-                println!("pet-daemon: 已有实例在监听 127.0.0.1:{port}，本进程退出（单例）");
+                println!("litepet: 已有实例在监听 127.0.0.1:{port}，本进程退出（单例）");
                 std::process::exit(0);
             }
-            eprintln!("pet-daemon: 端口 {port} 上没有任何服务在监听，无法继续");
+            eprintln!("litepet: 端口 {port} 上没有任何服务在监听，无法继续");
             std::process::exit(1);
         }
     };
     let token = match config::random_token() {
         Ok(token) => token,
         Err(err) => {
-            eprintln!("pet-daemon: {err:#}");
+            eprintln!("litepet: {err:#}");
             return;
         }
     };
     match config::write_endpoint(protocol::PROTOCOL_VERSION, port, &token) {
         Ok(path) => println!(
-            "pet-daemon: 监听 http://127.0.0.1:{port}{}（对接信息 {}）",
+            "litepet: 监听 http://127.0.0.1:{port}{}（对接信息 {}）",
             http::RPC_PATH,
             path.display()
         ),
         Err(err) => {
-            eprintln!("pet-daemon: {err:#}");
+            eprintln!("litepet: {err:#}");
             return;
         }
     }
@@ -191,13 +191,13 @@ fn start_http(app: tauri::AppHandle, loaded: &pack::LoadedPet, port: u16, reside
     let hooks = Arc::new(http::Hooks {
         display: Box::new(move |directive| {
             if let Err(err) = app.emit("display", directive) {
-                eprintln!("pet-daemon: 推送渲染层失败：{err}");
+                eprintln!("litepet: 推送渲染层失败：{err}");
             }
         }),
         exit: Box::new(move || {
             // 正常退出时收拾对接信息；失败只提示，不影响退出。
             if let Err(err) = config::remove_endpoint() {
-                eprintln!("pet-daemon: {err:#}");
+                eprintln!("litepet: {err:#}");
             }
             exit_app.exit(0);
         }),
@@ -217,11 +217,11 @@ fn parse_args() -> (bool, Option<u16>) {
             "--resident" => resident = true,
             "--port" => port = args.next().and_then(|raw| raw.parse().ok()),
             "--help" | "-h" => {
-                println!("pet-daemon [--resident] [--port <端口>]");
+                println!("litepet [--resident] [--port <端口>]");
                 std::process::exit(0);
             }
             other => {
-                eprintln!("pet-daemon: 未知参数 {other}（--help 查看用法）");
+                eprintln!("litepet: 未知参数 {other}（--help 查看用法）");
                 std::process::exit(2);
             }
         }
@@ -232,7 +232,7 @@ fn parse_args() -> (bool, Option<u16>) {
 fn main() {
     let (resident, port) = parse_args();
     if resident {
-        println!("pet-daemon: 常驻模式，全部宿主断开后不退出");
+        println!("litepet: 常驻模式，全部宿主断开后不退出");
     }
     tauri::Builder::default()
         .setup(move |app| {

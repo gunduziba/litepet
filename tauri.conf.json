@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "pet-daemon",
+  "productName": "LitePet",
   "version": "0.1.0",
-  "identifier": "com.litepet.pet-daemon",
+  "identifier": "com.litepet.desktop",
   "build": {
     "frontendDist": "./ui"
   },

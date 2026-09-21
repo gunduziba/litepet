@@ -1,7 +1,7 @@
 //! `pet.json` 反序列化与网格解析。
 //!
 //! 字段名严格对齐 Codex `codex-rs/tui/src/pets/model.rs`；`PetFile` 不设
-//! `deny_unknown_fields`，这正是我们能在同一个 `pet.json` 里塞 `petdaemon` 键的原因
+//! `deny_unknown_fields`，这正是我们能在同一个 `pet.json` 里塞 `litepet` 键的原因
 //! （`docs/PET-PACK.md` §4.1）——Codex 与我们都读它，各取所需、互不报错。
 
 use super::image::AtlasSize;
@@ -49,7 +49,7 @@ pub(super) struct PetFile {
     pub(super) animations: HashMap<String, AnimationSpec>,
     /// 我们的扩展键，由行为模块解析（`docs/PET-PACK.md` §4.2）。
     #[serde(default)]
-    pub(super) petdaemon: Option<serde_json::Value>,
+    pub(super) litepet: Option<serde_json::Value>,
 }
 
 /// `pet.json` 的 `frame` 字段；四个字段都必填。
@@ -219,7 +219,7 @@ mod tests {
             frame: None,
             sprite_version_number: version,
             animations: HashMap::new(),
-            petdaemon: None,
+            litepet: None,
         }
     }
 

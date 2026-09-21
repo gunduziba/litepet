@@ -46,8 +46,8 @@ pub struct Setup {
     pub pet_id: String,
     /// 该包声明的动画名集合。
     pub known: BTreeSet<String>,
-    /// `pet.json` 里 `petdaemon` 扩展键的原值；`None` 表示纯 Codex 包。
-    pub petdaemon: Option<Value>,
+    /// `pet.json` 里 `litepet` 扩展键的原值；`None` 表示纯 Codex 包。
+    pub litepet: Option<Value>,
     /// 常驻模式：永不由 linger 触发退出。
     pub resident: bool,
 }
@@ -98,7 +98,7 @@ pub struct Session {
 impl Session {
     /// 构造会话。
     pub fn new(setup: Setup) -> Result<Self> {
-        let behavior = Behavior::new(setup.petdaemon.as_ref(), &setup.known)?;
+        let behavior = Behavior::new(setup.litepet.as_ref(), &setup.known)?;
         Ok(Self {
             arbiter: Arbiter::new(),
             behavior,
@@ -149,17 +149,17 @@ impl Session {
         let reaped = self.arbiter.reap_dead(now, HOST_TIMEOUT);
         for host in &reaped {
             println!(
-                "pet-daemon: 宿主 {host} 已 {}s 无消息，视为断开",
+                "litepet: 宿主 {host} 已 {}s 无消息，视为断开",
                 HOST_TIMEOUT.as_secs()
             );
         }
         if !reaped.is_empty() {
-            println!("pet-daemon: 当前宿主 {} 个", self.host_count());
+            println!("litepet: 当前宿主 {} 个", self.host_count());
             self.begin_linger_if_empty(now);
         }
 
         if self.linger_expired(now) {
-            println!("pet-daemon: 已无宿主连接满 {}s，退出", LINGER.as_secs());
+            println!("litepet: 已无宿主连接满 {}s，退出", LINGER.as_secs());
             self.retired = true;
             return Outcome::Exit;
         }
@@ -239,14 +239,14 @@ impl Session {
         }
 
         println!(
-            "pet-daemon: 宿主 {} 已接入（pid {}{}{}）",
+            "litepet: 宿主 {} 已接入（pid {}{}{}）",
             msg.host,
             msg.pid.map_or_else(|| "-".to_string(), |pid| pid.to_string()),
             suffix("agent", msg.agent_version.as_deref()),
             suffix("client", msg.client_version.as_deref()),
         );
         self.arbiter.register(&msg.host, now);
-        println!("pet-daemon: 当前宿主 {} 个", self.host_count());
+        println!("litepet: 当前宿主 {} 个", self.host_count());
         self.empty_since = None;
         Ok(protocol::hello_result(
             env!("CARGO_PKG_VERSION"),
@@ -257,12 +257,12 @@ impl Session {
     /// `host/bye`：宿主正常退出。
     fn bye(&mut self, msg: HostBye, now: Instant) -> Result<Value, ErrorObject> {
         println!(
-            "pet-daemon: 宿主 {} 已断开{}",
+            "litepet: 宿主 {} 已断开{}",
             msg.host,
             suffix("原因", msg.reason.as_deref()),
         );
         self.arbiter.unregister(&msg.host);
-        println!("pet-daemon: 当前宿主 {} 个", self.host_count());
+        println!("litepet: 当前宿主 {} 个", self.host_count());
         self.begin_linger_if_empty(now);
         Ok(Value::Null)
     }
@@ -280,12 +280,12 @@ impl Session {
         now: Instant,
     ) -> Result<Value, ErrorObject> {
         println!(
-            "pet-daemon: 宿主 {} 开始工作{}",
+            "litepet: 宿主 {} 开始工作{}",
             msg.host,
             parens("session", msg.session_id.as_deref()),
         );
         if let Some(summary) = msg.summary.as_deref() {
-            println!("pet-daemon: 宿主 {} 任务：{summary}", msg.host);
+            println!("litepet: 宿主 {} 任务：{summary}", msg.host);
         }
         self.arbiter.on_agent_start(&msg.host, now);
         // 状态迁移类规则：显式 play 持续到下次状态变迁。
@@ -303,7 +303,7 @@ impl Session {
         now: Instant,
     ) -> Result<Value, ErrorObject> {
         println!(
-            "pet-daemon: 宿主 {} 结束工作（{}）{}",
+            "litepet: 宿主 {} 结束工作（{}）{}",
             msg.host,
             if msg.success { "成功" } else { "失败" },
             parens("session", msg.session_id.as_deref()),
@@ -365,7 +365,7 @@ impl Session {
             // 降级显示而不是拒绝（协议前向兼容），但必须留痕：
             // 适配器作者在对面看不到任何报错，这条日志是唯一的排错线索。
             println!(
-                "pet-daemon: 宿主 {} 发来未知气泡类别，按最低优先级显示：{}",
+                "litepet: 宿主 {} 发来未知气泡类别，按最低优先级显示：{}",
                 msg.host, msg.text
             );
         }
@@ -479,7 +479,7 @@ mod tests {
             .collect()
     }
 
-    /// 造一份带规则表的宠物包行为配置（含 `petdaemon` 外壳）。
+    /// 造一份带规则表的宠物包行为配置（含 `litepet` 外壳）。
     fn rules() -> Value {
         json!({
             "schemaVersion": 1,
@@ -503,7 +503,7 @@ mod tests {
         Session::new(Setup {
             pet_id: "xunjian-miao".to_string(),
             known: known(),
-            petdaemon: Some(rules()),
+            litepet: Some(rules()),
             resident: false,
         })
         .expect("应能构造会话")
@@ -825,7 +825,7 @@ mod tests {
         let mut session = Session::new(Setup {
             pet_id: "xunjian-miao".to_string(),
             known: known(),
-            petdaemon: Some(rules()),
+            litepet: Some(rules()),
             resident: true,
         })
         .expect("应能构造");

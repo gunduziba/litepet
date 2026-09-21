@@ -78,7 +78,7 @@ pub fn serve(server: Server, sessions: Arc<Mutex<Session>>, token: String, hooks
                 // 超时是正常的：空转交给 ticker 线程，这里只是回来看看有没有新请求。
                 Ok(None) => {}
                 Err(err) => {
-                    eprintln!("pet-daemon: 接收请求失败，该工作线程退出：{err}");
+                    eprintln!("litepet: 接收请求失败，该工作线程退出：{err}");
                     return;
                 }
             }
@@ -96,7 +96,7 @@ fn spawn_ticker(sessions: Arc<Mutex<Session>>, hooks: Arc<Hooks>) {
         let deadline = match sessions.lock() {
             Ok(session) => session.next_deadline(Instant::now()),
             Err(_) => {
-                eprintln!("pet-daemon: 会话状态已损坏，空转线程退出");
+                eprintln!("litepet: 会话状态已损坏，空转线程退出");
                 return;
             }
         };
@@ -181,7 +181,7 @@ fn dispatch(
         Err(error) => {
             if notification {
                 // 通知没有回复通道，只能记日志（JSON-RPC 2.0 §4.1）。
-                eprintln!("pet-daemon: 通知 {} 被拒：{}", request.method, error.message);
+                eprintln!("litepet: 通知 {} 被拒：{}", request.method, error.message);
                 None
             } else {
                 Some(JsonResponse::failure(id, error).to_body())
@@ -257,7 +257,7 @@ fn respond_json(request: Request, body: &str) {
 /// 统一收尾：回响应并记录失败。
 fn finish<R: Read>(request: Request, response: HttpResponse<R>) {
     if let Err(err) = request.respond(response) {
-        eprintln!("pet-daemon: 回响应失败：{err}");
+        eprintln!("litepet: 回响应失败：{err}");
     }
 }
 
@@ -317,7 +317,7 @@ mod tests {
         let session = Session::new(Setup {
             pet_id: "xunjian-miao".to_string(),
             known,
-            petdaemon: None,
+            litepet: None,
             resident: true,
         })
         .expect("应能构造会话");

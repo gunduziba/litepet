@@ -1,4 +1,4 @@
-# 桌宠协议 v1（pet-daemon）
+# 桌宠协议 v1（litepet）
 
 > 状态：**已定稿**（M0 定契约，M2 换传输）｜ 实现互操作契约，任何适配器不得偏离本文
 >
@@ -6,7 +6,7 @@
 
 ## 0. 定位
 
-`pet-daemon` 是一个**单例守护进程**，在屏幕角落显示一只白鼬。
+`litepet` 是一个**单例守护进程**，在屏幕角落显示一只白鼬。
 
 - daemon **不认识**任何宿主（pi / dsh / 其他）的代码，只认本协议
 - 多个宿主**打同一个 daemon**，而不是各开一只宠物
@@ -144,7 +144,7 @@ daemon 在**端口绑定成功之后**写出端点文件，宿主读它拿端口
 | 缺必需字段 / 类型错 | `-32602`；若为通知则只记 daemon 日志（无回复通道） |
 
 > 未知 `kind` 不拒绝是刻意的：`pet/bubble` 是通知，拒了它适配器作者只会看到「什么也没发生」。
-> 但同一个未知 `kind` 写在**包配置** `petdaemon.behavior` 里是**加载期硬拒**的——线格式是别人的新版本，包配置是自己的声明，拼错不能静默。
+> 但同一个未知 `kind` 写在**包配置** `litepet.behavior` 里是**加载期硬拒**的——线格式是别人的新版本，包配置是自己的声明，拼错不能静默。
 
 ## 5. daemon → 宿主
 
@@ -234,7 +234,7 @@ idle ──agent.start──► working ──agent.end(success)──► celebr
 
 ### 9.1 动作组
 
-组是**我们**的概念（Codex 格式里没有），定义在 `petdaemon.behavior.groups`（契约见 `docs/PET-PACK.md` §4.2）。组的语义与 `SPEC.md` §3.4 一致，组内多个动画按轮换规则选用。
+组是**我们**的概念（Codex 格式里没有），定义在 `litepet.behavior.groups`（契约见 `docs/PET-PACK.md` §4.2）。组的语义与 `SPEC.md` §3.4 一致，组内多个动画按轮换规则选用。
 
 ### 9.2 内置包
 
@@ -261,9 +261,9 @@ idle ──agent.start──► working ──agent.end(success)──► celebr
 | `agent/end`(fail) | `feedback`：`stoat_wave_backflip_smoke_fade_exit` | `info`：任务失败 |
 | 90s 无事件 | `resting` 组轮换 | — |
 
-> 上表是**内置包** `pet.json` 里 `petdaemon.behavior.rules` 的等价描述（规则表契约见 `docs/PET-PACK.md` §4.3）。外部包在自己 manifest 里覆盖；daemon 侧只做**通用规则解释器**，不把这套映射写死在 Rust 代码里。
+> 上表是**内置包** `pet.json` 里 `litepet.behavior.rules` 的等价描述（规则表契约见 `docs/PET-PACK.md` §4.3）。外部包在自己 manifest 里覆盖；daemon 侧只做**通用规则解释器**，不把这套映射写死在 Rust 代码里。
 >
-> 纯 Codex 包（无 `petdaemon` 键）走 `docs/PET-PACK.md` §4.4 的降级映射表。
+> 纯 Codex 包（无 `litepet` 键）走 `docs/PET-PACK.md` §4.4 的降级映射表。
 
 ## 10. 手工验证
 

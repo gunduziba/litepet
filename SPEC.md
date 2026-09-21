@@ -1,4 +1,4 @@
-# 跨 Harness 桌宠（pet-daemon）实现规格书
+# 跨 Harness 桌宠（litepet）实现规格书
 
 > 版本：v0.1 草案 ｜ 目标平台：macOS（arm64）优先 ｜ 交接文档：执行 agent 从本文档零上下文开工
 >
@@ -27,7 +27,7 @@
 ## 1. 架构总览
 
 ```text
-┌─ pi TUI ───────────────┐                          ┌─ pet-daemon（Tauri App）─────────────┐
+┌─ pi TUI ───────────────┐                          ┌─ litepet（Tauri App）─────────────┐
 │ ~/.pi/agent/extensions/ │  HTTP + JSON-RPC 2.0     │ Rust 侧：                            │
 │ pet.ts                  │ ─────┐                   │  - HTTP server（回环 + Bearer 鉴权） │
 │  pi.on(...) 事件适配     │      │    协议 v1         │  - 宿主注册表 + 心跳 + 仲裁          │
@@ -43,7 +43,7 @@
 
 | 组件 | 产物 | 归属 |
 |---|---|---|
-| pet-daemon | Tauri App（.app/.dmg） | **本仓库**（服务端 + 协议契约） |
+| litepet | Tauri App（.app/.dmg） | **本仓库**（服务端 + 协议契约） |
 | pi 适配器 | 单文件 `pet.ts` 放 `~/.pi/agent/extensions/` | **独立定义、独立发版，不在本仓库** |
 | dsh 适配器 | dsh plugin bundle | **独立定义、独立发版，不在本仓库** |
 
@@ -103,7 +103,7 @@
 - 所有宿主注销 → linger 30 秒（可配 `--resident` 常驻）→ 退出
 - 宿主侧原则：进程启动时读 `daemon.json` + `host/hello`；退出时尽量发一条 `host/bye`，不发也只是等 60s 心跳超时
 
-## 3. 组件 A：pet-daemon（Tauri）
+## 3. 组件 A：litepet（Tauri）
 
 ### 3.1 环境准备（⚠️ 本机未装 Rust，需先装）
 
@@ -285,7 +285,7 @@ L3 是唯一能把 §3.4 「策略逻辑要手写 Rust」这条成本压下去�
 - 未知 `method`：通知静默忽略；请求回 `-32601`
 - 未知 `params` 字段：忽略，不报错（无 `deny_unknown_fields`）
 - 未知 `bubble.kind`：**降级显示**而不拒绝（`BubbleKind::Unknown`，优先级最低）
-  注：同样的未知 `kind` 写在**包配置** `petdaemon.behavior` 里则**加载期硬拒**——线格式是别人的新版本，包配置是自己的声明，拼错不能静默
+  注：同样的未知 `kind` 写在**包配置** `litepet.behavior` 里则**加载期硬拒**——线格式是别人的新版本，包配置是自己的声明，拼错不能静默
 - 参数真缺必需字段/类型错：回 `-32602`；若为通知则只记 daemon 日志
 
 ## 5. dsh 适配器（同样独立定义）
@@ -326,7 +326,7 @@ L3 是唯一能把 §3.4 「策略逻辑要手写 Rust」这条成本压下去�
 已逐项验过 `assets/pet-440/*.webp` 均为 `Alpha: 1, Animation: 1`。
 
 - 素材来源：Open Vetta 仓库（Apache-2.0），原始 webm 位于 `apps/desktop/build/pet/`
-- **必须**：在 pet-daemon 项目中保留 Apache-2.0 要求的版权与许可声明；动手前核对 `/Users/eee/tools/open-vetta/NOTICE` 中是否有针对这批素材的额外归属说明（若 NOTICE 把素材列为第三方，则按 NOTICE 归属，不可直接搬）
+- **必须**：在 litepet 项目中保留 Apache-2.0 要求的版权与许可声明；动手前核对 `/Users/eee/tools/open-vetta/NOTICE` 中是否有针对这批素材的额外归属说明（若 NOTICE 把素材列为第三方，则按 NOTICE 归属，不可直接搬）
 - **动作 id 由宠物包 manifest 声明，不得从文件名推断**（§3.8 / `docs/PET-PACK.md` §4）。内置包恰好满足「文件名 = 动作 id」，但外部包允许文件名任意，否则用户无法用自己命名的素材
 - ⚠️ **转码脚本缺失，素材当前不可复现**：`assets/pet-440/` 是早期在 `/tmp` 里一次性用 `img2webp` 生成的，`scripts/` 目录**为空**，仓库内无任何转码代码。M1 动手前必须补 `scripts/transcode-pet-assets.sh`（工具链见 §3.5）
 

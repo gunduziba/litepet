@@ -279,7 +279,7 @@ mod tests {
     /// 非图集数据必须报错，不能猜出尺寸。
     #[test]
     fn unknown_format_is_rejected() {
-        let dir = std::env::temp_dir().join("pet-daemon-test-image");
+        let dir = std::env::temp_dir().join("litepet-test-image");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("建目录失败");
         let path = dir.join("garbage.bin");

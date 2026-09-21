@@ -72,7 +72,7 @@ function advance(plan) {
 function play(name) {
   const plan = pack?.animations?.[name];
   if (!plan) {
-    console.warn(`pet-daemon: 未知动画 ${name}，保持当前动画`);
+    console.warn(`litepet: 未知动画 ${name}，保持当前动画`);
     return;
   }
   if (currentName === name) return;
@@ -130,4 +130,4 @@ async function boot() {
   await watchDisplay();
 }
 
-boot().catch((err) => console.error('pet-daemon: 渲染层启动失败', err));
+boot().catch((err) => console.error('litepet: 渲染层启动失败', err));

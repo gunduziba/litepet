@@ -158,7 +158,7 @@ Rust 侧 `collect_asset_paths` 分三支校验，错误串可直接复用：`"pe
 
 环境变量只设**一个** `LITEPET_HOME` 覆盖整个家目录，而不是用 `LITEPET_PETS_DIR` 单独覆盖宠物目录。理由：**Codex 本身就是 `CODEX_HOME` 这个形状**（`{CODEX_HOME}/pets/<id>/pet.json`），沿用同一模式降低认知成本，也避开「配置在 A、宠物在 B」的割裂。
 
-> **与 `SPEC.md` §3.6 的偏差**：那里写的是 macOS 原生路径 `~/Library/Application Support/pet-daemon/config.json`。现改从 `~/.litepet/`（dotdir 约定）。取舍：放弃平台惯例，换来「配置与素材同处一地、可手工编辑、与 Codex 一致」。文件格式仍是 JSON（`config.json`），不改成 Codex 的 TOML。
+> **与 `SPEC.md` §3.6 的偏差**：那里写的是 macOS 原生路径 `~/Library/Application Support/litepet/config.json`。现改从 `~/.litepet/`（dotdir 约定）。取舍：放弃平台惯例，换来「配置与素材同处一地、可手工编辑、与 Codex 一致」。文件格式仍是 JSON（`config.json`），不改成 Codex 的 TOML。
 >
 > 注：`~/.codex/pets/<id>/` 里若存在同名包，daemon **不读**。我们只是「用 Codex 的格式」，不接管 Codex 的家目录。
 
@@ -424,13 +424,13 @@ is_animated: False   n_frames: 1   alpha 极值: (0, 255)   ≈ 1.62 MB
 >
 > **⚠️ V2 的第 9–10 行**：社区文档称为注视方向（`look-directions-a/b`），**未从源码确证**，实现时以实际图集目视为准。
 >
-> 【我们的 `petdaemon.behavior.groups` 引用这套行名；纯 Codex 包走 §4.4 降级映射。】
+> 【我们的 `litepet.behavior.groups` 引用这套行名；纯 Codex 包走 §4.4 降级映射。】
 
 > **素材许可提醒**：codex-pets.net 是社区上传站，包内**无 licence 字段**。`xunjian-miao` 仅作**开发用素材**，不随仓库发行；发行用内置包需换成明确许可（CC0）的素材。
 
 ---
 
-## 4. 我们的扩展：`petdaemon` 命名空间
+## 4. 我们的扩展：`litepet` 命名空间
 
 ### 4.1 为什么能与 Codex 共存
 
@@ -450,7 +450,7 @@ Codex 的 `PetFile` **没有 `deny_unknown_fields`**（§3.2）→ 同一份 `pe
   },
 
   // ↓↓↓ 只有我们读的（Codex 忽略）
-  "petdaemon": {
+  "litepet": {
     "schemaVersion": 1,
     "license": "Apache-2.0",
     "behavior": {
@@ -478,9 +478,9 @@ Codex 的 `PetFile` **没有 `deny_unknown_fields`**（§3.2）→ 同一份 `pe
 **收益**：
 - 单向依赖解除 → **同一份包，Codex 能读，我们也能读**（L1/L2 双向互操作）
 - 我们的行为规则（L3）不污染 Codex 的字段空间
-- 纯 Codex 包（没有 `petdaemon` 键）我们**照样能加载**，用 §3.7 的默认动画表跑
+- 纯 Codex 包（没有 `litepet` 键）我们**照样能加载**，用 §3.7 的默认动画表跑
 
-### 4.2 `petdaemon` 字段
+### 4.2 `litepet` 字段
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -514,7 +514,7 @@ Codex 的 `PetFile` **没有 `deny_unknown_fields`**（§3.2）→ 同一份 `pe
 | `feedback.celebrate` | `wave`（缺则 `waving`） | 庆祝 |
 | — | `running-left` / `running-right` / `review` / `move_*` | **不映射**（桌面贴边场景无走路需求） |
 
-映射表**写在 Rust 常量里**（因为 Codex 包里没有规则数据，只能由我们兜底），但**仅用于降级路径**；有 `petdaemon.behavior` 的包一律走规则表。
+映射表**写在 Rust 常量里**（因为 Codex 包里没有规则数据，只能由我们兜底），但**仅用于降级路径**；有 `litepet.behavior` 的包一律走规则表。
 
 ---
 
@@ -558,7 +558,7 @@ Codex 格式要求**单张图集**，而我们现有素材是 8 个独立的 ani
 | `spritesheetPath` 缺失／文件不存在／解不出 alpha | 拒绝加载该包，不影响其他包 |
 | `spritesheetPath` 越出包目录 | 拒绝加载（见 §7.2） |
 
-`petdaemon.groups` 里引用的动画 id 同样必须存在，否则拒绝加载。
+`litepet.groups` 里引用的动画 id 同样必须存在，否则拒绝加载。
 
 ---
 

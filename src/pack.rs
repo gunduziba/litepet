@@ -87,7 +87,7 @@ pub struct PetInfo {
 pub struct LoadedPet {
     /// 渲染层需要的包信息。
     pub info: PetInfo,
-    /// `petdaemon` 扩展键的原始 JSON（`docs/PET-PACK.md` §4.2），由行为模块解析。
+    /// `litepet` 扩展键的原始 JSON（`docs/PET-PACK.md` §4.2），由行为模块解析。
     pub behavior: Option<serde_json::Value>,
 }
 
@@ -106,7 +106,7 @@ pub fn load(pets_root: &Path, id: &str) -> Result<LoadedPet> {
     let atlas = image::read_size(&sheet)?;
     let frame = manifest::resolve_grid(&file, atlas)?;
     for warning in manifest::grid_warnings(&file, frame) {
-        eprintln!("pet-daemon: 包 {id} 告警：{warning}");
+        eprintln!("litepet: 包 {id} 告警：{warning}");
     }
     let animations = animations::build(frame, &file.animations)?;
 
@@ -119,7 +119,7 @@ pub fn load(pets_root: &Path, id: &str) -> Result<LoadedPet> {
             frame,
             animations,
         },
-        behavior: file.petdaemon.clone(),
+        behavior: file.litepet.clone(),
     })
 }
 
@@ -156,7 +156,7 @@ mod tests {
     /// 真实社区包的图集尺寸（8 列 × 11 行）。
     const V2_ATLAS: (u32, u32) = (1536, 2288);
     /// 测试用临时根目录名。
-    const TEST_ROOT: &str = "pet-daemon-test-pack";
+    const TEST_ROOT: &str = "litepet-test-pack";
 
     /// 造一个能通过尺寸解析的 PNG 图集文件。
     fn write_atlas(path: &Path, width: u32, height: u32) {
@@ -198,23 +198,23 @@ mod tests {
         assert_eq!(loaded.info.display_name, "巡检喵");
         assert_eq!((loaded.info.frame.columns, loaded.info.frame.rows), (8, 11));
         assert_eq!(loaded.info.animations.len(), 16);
-        assert!(loaded.behavior.is_none(), "纯 Codex 包没有 petdaemon 键");
+        assert!(loaded.behavior.is_none(), "纯 Codex 包没有 litepet 键");
         let _ = fs::remove_dir_all(root.parent().expect("有父目录"));
     }
 
-    /// `petdaemon` 键必须原样透出，且不影响 Codex 字段的解析。
+    /// `litepet` 键必须原样透出，且不影响 Codex 字段的解析。
     #[test]
-    fn petdaemon_extension_is_passed_through() {
+    fn litepet_extension_is_passed_through() {
         let manifest = r#"{
             "id": "extended",
             "spritesheetPath": "spritesheet.png",
             "spriteVersionNumber": 2,
             "animations": { "cheer": { "frames": [8, 9, 10], "fps": 12, "loop": false } },
-            "petdaemon": { "schemaVersion": 1, "behavior": { "idleTimeoutMs": 90000 } }
+            "litepet": { "schemaVersion": 1, "behavior": { "idleTimeoutMs": 90000 } }
         }"#;
         let (root, id) = make_pack("extended", manifest);
         let loaded = load(&root, &id).expect("应加载成功");
-        let behavior = loaded.behavior.expect("应透出 petdaemon");
+        let behavior = loaded.behavior.expect("应透出 litepet");
         assert_eq!(behavior["schemaVersion"], 1);
         // 覆盖表生效，且缺省动画仍在
         let cheer = &loaded.info.animations["cheer"];
