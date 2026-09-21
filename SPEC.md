@@ -43,9 +43,13 @@
 
 | 组件 | 产物 | 归属 |
 |---|---|---|
-| pet-daemon | Tauri App（.app/.dmg） | 本仓库主体 |
-| pi 适配器 | 单文件 `pet.ts` 放 `~/.pi/agent/extensions/` | 可选交付，也可只给文档 |
-| dsh 适配器 | dsh plugin bundle | 可选交付 |
+| pet-daemon | Tauri App（.app/.dmg） | **本仓库**（服务端 + 协议契约） |
+| pi 适配器 | 单文件 `pet.ts` 放 `~/.pi/agent/extensions/` | **独立定义、独立发版，不在本仓库** |
+| dsh 适配器 | dsh plugin bundle | **独立定义、独立发版，不在本仓库** |
+
+**本仓库只交付 daemon 与协议定义**：`docs/PROTOCOL.md` 是唯一契约。宿主侧适配器由宿主方各自实现，本仓库不含参考实现。协议中立（§0 约束 1）既是架构约束，也是交付边界。
+
+> 仓库内唯一像「发送端」的东西是 `scripts/host-sim.mjs`：它是**协议压测/回归工具**，不是发给任何宿主用的适配器，也不属于适配器范敵。
 
 ## 2. 协议规范 v1（先定稿再写码）
 
@@ -248,50 +252,53 @@ L3 是唯一能把 §3.4 「策略逻辑要手写 Rust」这条成本压下去�
 
 依据：PetPal Desktop 的格式允许任意动作名，但运行时只播硬编码子集——演示包声明了 `sit: [9,12]`、目录里有 `actions/look_right/`，而在 `src/main.js` 里按名统计 `sit`、`look` 各为 **0 次命中**，永远不会被触发；`anchor`、`sounds`、`portrait` 同样 0 次命中，`personality.catchphrases` 只写不读。**死 schema 比直接不支持更糟**，因为用户会以为能用。详见 `docs/PET-PACK.md` §0.1。
 
-## 4. 组件 B：pi 扩展适配器
+## 4. 宿主适配器的职责边界
 
-**✅ 已核实**（源：pi 扩展文档 `extensions.md`）：
+适配器**独立定义、独立发版，不在本仓库**。但职责边界必须写死，否则「统一」会退化成「每个宿主各写一套语义」。
 
-- 扩展位置：`~/.pi/agent/extensions/pet.ts`（全局自动发现，支持 `/reload` 热重载）
-- 扩展是普通 TS 模块，拥有完整系统权限：可直接 `import { readFile } from "node:fs"`、`node:child_process`
-- **宿主侧零依赖**：HTTP 客户端用内置 `fetch`，不需要 socket 库
-- 可用事件（本适配器需要的全部）：
-  - `pi.on("session_start")` → 读 `daemon.json` + `host/hello`
-  - `pi.on("session_shutdown")` → `host/bye`
-  - `pi.on("agent_start")` → `agent/start`
-  - `pi.on("agent_end")` → `agent/end`
-  - `pi.on("tool_execution_start")` → `tool/start`（事件里取工具名）
-  - `pi.on("tool_execution_end")` → `tool/end`
-  - 事件详细 payload 结构写码前读 `docs/extensions.md` 的 Events 章节核对
-- `pi.registerCommand()` 注册 `/pet` 命令（开关/查看连接状态）
-- 心跳：`setInterval` 20s 发 `daemon/ping`。**无需重连逻辑**——HTTP 上没有连接可断，每个事件都是独立请求，daemon 挂了就等它重启后重新 `host/hello`
+**适配器负责**（宿主私有知识，daemon 不该知道）：
 
-骨架（可直接用）：
+1. **事件订阅**——把宿主 API（如 `pi.on(...)`）接到协议方法上
+2. **载荷归一化**——宿主私有枚举/结构 → 协议中立的值。例：pi 的 `stopReason: "error"|"aborted"` → `success: false`；pi 的 `bash` 工具参数 `{command}` → `bubble` 短文本
+3. 心跳、宿主标识、`host/hello` / `host/bye` 生命周期
+4. 容错：超时、吞异常、daemon 不在时静默降级（**桌宠的问题不能变成宿主的问题**）
 
-```ts
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
-import { homedir } from "node:os";
+**适配器不负责**（daemon 独占）：
 
-export default function (pi: ExtensionAPI) {
-  // 状态：端点（{port, token}）+ 心跳定时器
-  // 实现：读 ~/.litepet/daemon.json → host/hello → 事件转发 → 20s daemon/ping
-  // 细节按本节上文规则补全
-}
-```
+1. 播什么动画、播多久、动画优先级
+2. 气泡着色、优先级、截断到显示宽度
+3. 多宿主仲裁与徽章
 
-## 5. 组件 C：dsh 插件适配器
+**边界判据**（三条都过才算划对）：
+
+| 变更 | 只应影响 |
+|---|---|
+| 宿主改了事件 payload 结构 | 适配器 |
+| 重新设计动画集 | daemon |
+| dsh 的工具参数 schema 与 pi 不同 | 适配器 |
+
+> **反面案例**：若适配器把整个工具参数对象原样转发、由 daemon 去认 `bash.command`，那 daemon 就被迫理解 pi 的工具 schema。
+> 这不是「中立」，而是把耦合翻了个方向。所以「从参数里提取气泡文本」看似是展示逻辑，实际必须留在适配器里。
+
+**协议为独立适配器提供的保证**（daemon 侧已实现并有测试）：
+
+- 未知 `method`：通知静默忽略；请求回 `-32601`
+- 未知 `params` 字段：忽略，不报错（无 `deny_unknown_fields`）
+- 未知 `bubble.kind`：**降级显示**而不拒绝（`BubbleKind::Unknown`，优先级最低）
+  注：同样的未知 `kind` 写在**包配置** `petdaemon.behavior` 里则**加载期硬拒**——线格式是别人的新版本，包配置是自己的声明，拼错不能静默
+- 参数真缺必需字段/类型错：回 `-32602`；若为通知则只记 daemon 日志
+
+## 5. dsh 适配器（同样独立定义）
 
 **✅ 已核实**：dsh = deepseek-ai/deepseek-harness，MIT，Cordis 框架「一切皆插件」（类型化事件贡献到共享上下文），out-of-tree bundle 是官方认可的扩展形态（先例：dsh-tui、DSH-Code、codsh 均为社区 bundle）。
 
-**⚠️ 待执行时核实（写码前必做）**：
+**⚠️ 待执行时核实（写适配器前必做）**：
 
-1. agent loop 插件对外发布的**具体事件名与 payload**——读 https://deepseek-harness.github.io/deepseek-harness/reference/ 与仓库源码，把「agent 开始/结束、工具开始/结束」四个事件映射到协议 v1，找不到完全对应的事件就映射最接近的并在 README 说明差异
+1. agent loop 插件对外发布的**具体事件名与 payload**——读 https://deepseek-harness.github.io/deepseek-harness/reference/ 与仓库源码，把「agent 开始/结束、工具开始/结束」映射到协议 v1，找不到完全对应的事件就映射最接近的并在适配器 README 说明差异
 2. out-of-tree bundle 的**标准目录结构与打包方式**——参考 dsh-tui 的仓库结构
-3. dsh 侧配置文件/插件如何常驻后台连接（若插件生命周期跟随会话，则连接管理策略与 pi 适配器相同：会话起连、会话断开）
+3. 插件生命周期是否跟随会话（若是，心跳/注销策略与 pi 适配器同形：会话起连、会话断开）
 
-实现要求与 pi 适配器对齐：同一份协议、同一套心跳/重连/注销规则，仅事件订阅 API 不同。
+约束：同一份协议（`docs/PROTOCOL.md`）、同一套 §4 职责边界，仅事件订阅 API 不同。
 
 ## 6. Open Vetta 搬运清单（精确路径）
 
@@ -329,9 +336,9 @@ export default function (pi: ExtensionAPI) {
 |---|---|---|
 | M0 | 仓库初始化 + 本文档入库 + 协议 v1 定稿 | `docs/PROTOCOL.md` 与本文 §2 一致；CI（fmt/clippy/build）跑通 |
 | M1 | Tauri daemon：透明窗 + animated WebP 播放 + HTTP server + 状态机最小版 | `node scripts/host-sim.mjs` 演完整会话：宠物切打字动画 → 出气泡 → `agent/end` 后举杠铃 → 道别后 linger 30s 退出并删掉 `daemon.json`；二次启动检测单例 |
-| M2 | pi 适配器 | pi 里跑一次真实任务：agent 起时打字、结束举杠铃、工具调用出气泡；pi 退出后 daemon 注销该宿主；`/pet` 命令可用 |
+| M2 | 协议层可被真实宿主驱动（本仓库只做到这一步） | `node scripts/host-sim.mjs` 演完整会话全部通过；“宿主侧适配器”已移出本仓库，另在独立仓库验收（pi：`~/tools/pi-pet-adapter`） |
 | M3 | 点击穿透 + 拖拽/缩放/右键菜单 + 位置持久化 | 宠物不挡下层点击；点中宠物可拖可缩；重启后位置保留 |
-| M4 | dsh 适配器 | 与 M2 同标准在 dsh 上验收；pi+dsh 同时跑时仲裁与徽章正确 |
+| M4 | dsh 适配器（独立仓库） | 与 M2 同标准在 dsh 上验收；pi+dsh 同时跑时仲裁与徽章正确 |
 | M5 | 打磨：省电、气泡换肤 JSON、`--resident`、登录自启、dmg 打包 | 手工清单逐项过 |
 
 每完成一个里程碑：git commit（中文 commit message）+ 在本文档勾选状态。
