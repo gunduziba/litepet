@@ -107,6 +107,7 @@ async function boot() {
   // 调试入口：控制台可 __pet.play('waving')
   window.__pet = { play, redraw, get pack() { return pack; } };
   play('idle');
+  await invoke('renderer_ready', { animations: Object.keys(pack.animations).length });
   await watchStates();
 }
 

@@ -22,6 +22,12 @@ fn pack_info(state: tauri::State<'_, PetState>) -> std::result::Result<pack::Pet
         .ok_or_else(|| "宠物包尚未加载，请检查 ~/.litepet/pets".to_string())
 }
 
+/// 渲染层就绪握手：前端加载完宠物包后调用，便于确认宠物确实已上屏。
+#[tauri::command]
+fn renderer_ready(animations: usize) {
+    println!("pet-daemon: 渲染层就绪，可用动画 {animations} 个");
+}
+
 /// 选中要加载的包 id：优先配置指定，否则取 `pets/` 下第一个可用包。
 fn pick_pack(root: &Path, preferred: Option<&str>) -> Option<String> {
     if let Some(id) = preferred {
@@ -77,7 +83,7 @@ fn main() {
             app.manage(init_pet());
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![pack_info])
+        .invoke_handler(tauri::generate_handler![pack_info, renderer_ready])
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");
 }
