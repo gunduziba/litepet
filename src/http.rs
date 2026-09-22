@@ -645,7 +645,7 @@ mod tests {
         assert_eq!(alerts[0].spec.sound.as_deref(), Some("@done"));
         assert_eq!(alerts[0].title, "LitePet");
         assert_eq!(
-            alerts[0].body, "这一轮干完了",
+            alerts[0].body, "本轮会话结束",
             "没有气泡可借就用事件自带的描述"
         );
     }

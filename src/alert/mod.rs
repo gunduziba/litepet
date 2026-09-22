@@ -50,6 +50,11 @@ pub struct AlertSpec {
     pub desktop: bool,
     /// 是否推手机。
     pub push: bool,
+    /// 通知正文；支持 `{字段}` 插值，写 `{note}` 即把正文让给宿主。缺席时回落
+    /// 宿主给的 `note` → 本规则气泡文字 → 事件自带的一句话。
+    pub text: Option<String>,
+    /// 通知标题。缺席时用应用名。
+    pub title: Option<String>,
 }
 
 impl Default for AlertSpec {
@@ -59,6 +64,8 @@ impl Default for AlertSpec {
             sound: None,
             desktop: true,
             push: false,
+            text: None,
+            title: None,
         }
     }
 }
@@ -69,6 +76,17 @@ impl AlertSpec {
         if let Some(name) = self.sound.as_deref() {
             if name.trim().is_empty() {
                 bail!("{context} 的 alert.sound 不能为空字符串");
+            }
+        }
+        // 空串与「没写」在正文链上是两件事：没写会往下落，空串会变成一条空白通知。
+        for (field, value) in [
+            ("text", self.text.as_deref()),
+            ("title", self.title.as_deref()),
+        ] {
+            if let Some(value) = value {
+                if value.trim().is_empty() {
+                    bail!("{context} 的 alert.{field} 不能为空字符串");
+                }
             }
         }
         Ok(())
@@ -363,6 +381,9 @@ mod tests {
             sound: sound.map(str::to_string),
             desktop,
             push,
+            // 提醒层看不到文案：它在 `session` 那一层就折好了。
+            text: None,
+            title: None,
         }
     }
 

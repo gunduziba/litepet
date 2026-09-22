@@ -133,6 +133,9 @@ pub struct AgentEnd {
     /// 会话 id，仅用于日志。
     #[serde(default)]
     pub session_id: Option<String>,
+    /// 宿主为这条通知准备的一句话。包里的 `alert.text` 缺席时，它就是通知正文。
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// `agent/settled` 的参数。
@@ -149,6 +152,9 @@ pub struct AgentSettled {
     /// 会话 id，仅用于日志。
     #[serde(default)]
     pub session_id: Option<String>,
+    /// 宿主为这条通知准备的一句话。包里的 `alert.text` 缺席时，它就是通知正文。
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// `tool/start` 的参数。

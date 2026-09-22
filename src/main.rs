@@ -791,6 +791,9 @@ fn test_request() -> Request {
             sound: Some("@attention".to_string()),
             desktop: true,
             push: true,
+            // 测试提醒自带文案，不用事件那一套缺省。
+            text: None,
+            title: None,
         },
         "LitePet 测试提醒",
         "看到这条就说明这个通道是通的。",

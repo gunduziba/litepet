@@ -136,8 +136,8 @@ daemon 在**端口绑定成功之后**写出端点文件，宿主读它拿端口
 | `host/hello` | 请求 | `protocolVersion: number`, `pid?: number`, `agentVersion?: string`, `clientVersion?: string` | 注册宿主。**同一宿主的第一个调用必须是它** |
 | `host/bye` | 通知 | `reason?: string` | 主动注销；daemon 立即注销该宿主，不等心跳超时 |
 | `agent/start` | 通知 | `sessionId?: string`, `summary?: string` | 该宿主的 agent 开始干活 |
-| `agent/end` | 通知 | `success: boolean`, `sessionId?: string` | 该宿主的 agent 结束 |
-| `agent/settled` | 通知 | `sessionId?: string` | 该宿主的 agent **彻底结束，不会再自动继续**（见下） |
+| `agent/end` | 通知 | `success: boolean`, `sessionId?: string`, `note?: string` | 该宿主的 agent 结束 |
+| `agent/settled` | 通知 | `sessionId?: string`, `note?: string` | 该宿主的 agent **彻底结束，不会再自动继续**（见下） |
 | `tool/start` | 通知 | `toolName: string`, `bubble?: string` | 工具开始；`bubble` 为可选展示文本，**建议 ≤ 48 字符**，超长由 daemon 截断 |
 | `tool/end` | 通知 | `toolName: string`, `isError?: boolean` | 工具结束 |
 | `pet/bubble` | 通知 | `kind: "info"\|"status"\|"tool"\|"success"\|"warning"\|"error"`（未知值降级，见下）, `text: string`, `ttlMs?: number` | 直接发一条气泡 |
@@ -152,6 +152,7 @@ daemon 在**端口绑定成功之后**写出端点文件，宿主读它拿端口
 
 - 它**不带 `success`**：宿主能观察到的只是「不会再自动继续」这一个事实，成功与否属于 `agent/end` 的语义。逼宿主在这里重报一次结果，等于逼它自己编一个值（pi 的 `agent_settled` 事件里就没有这个字段），而本协议明令禁止宿主发送不确信的信息。daemon 自己记着每个宿主最近一次 `agent/end` 的结果，用它决定停稳后是庆祝还是给失败脸色；宿主重连（再次 `host/hello`）时该记录作废。
 - 没有规则命中它时，daemon 走包通用默认提醒（出声 + 系统通知）。提醒是 **daemon 本地副作用**，不出现在线格式里，细节见 `docs/PET-PACK.md` §4.5。
+- `note` 是宿主为这条通知准备的一句话（例如「改了三个文件，测试全绿」）。它是**可选**的：包里写了 `alert.text` 就听包的，包没写才轮到它，两者都没写则落回事件自带的一句话。正文另有 120 字上限，超出由 daemon 截断。这个字段不影响屏幕上的动画与气泡。
 
 ### 4.1 适配器独立演进产生的容错（v1 已实现）
 
@@ -290,7 +291,7 @@ idle ──agent.start──► working ──agent.end(success)──► celebr
 >
 > 纯 Codex 包（无 `litepet` 键）走 `docs/PET-PACK.md` §4.4 的降级映射表。
 
-**第三个通道：提醒**。上表只管屏幕上的宠物与气泡；提醒（声音 / 系统通知 / 手机推送）是**独立的旁路**，用不用它由规则表的 `alert` 字段决定（`docs/PET-PACK.md` §4.5）。没有规则命中时，有两个包通用的默认提醒：`agent/settled`（出声 + 通知）与失败的 `agent/end`。提醒内容没有气泡可借时用事件自带的一句话（如 `agent.settled` → 「这一轮干完了」），所以提醒永远不会是空壳。
+**第三个通道：提醒**。上表只管屏幕上的宠物与气泡；提醒（声音 / 系统通知 / 手机推送）是**独立的旁路**，用不用它由规则表的 `alert` 字段决定（`docs/PET-PACK.md` §4.5）。没有规则命中时，有两个包通用的默认提醒：`agent/settled`（出声 + 通知）与失败的 `agent/end`。提醒内容的来源链是「包里的 `alert.text` → 宿主推来的 `note` → 包里的气泡文字 → 事件自带的一句话」（如 `agent.settled` → 「本轮会话结束」），所以提醒永远不会是空壳。
 
 ## 10. 客户端 → daemon：daemon 级控制方法
 

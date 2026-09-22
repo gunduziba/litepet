@@ -205,6 +205,9 @@ impl Session {
         // 早先按 `has_rules()` 短路，那些默认提醒就永远到不了提醒层。
         let kind = protocol::rule_event(method);
         let rules = kind.map(|kind| self.behavior.resolve(&Event::new(kind, raw.clone())));
+        // 宿主留给提醒的那句话。从解析后的参数里取，不把 `note` 穿过处理函数：
+        // 那些函数只管舞台与气泡，再多一个与它们无关的参数只会拉长签名。
+        let mut note: Option<String> = None;
 
         let outcome = match method {
             protocol::method::HOST_HELLO => self.hello(parse_params(raw)?, now),
@@ -213,9 +216,15 @@ impl Session {
             protocol::method::AGENT_START => {
                 self.agent_start(parse_params(raw)?, rules.as_ref(), now)
             }
-            protocol::method::AGENT_END => self.agent_end(parse_params(raw)?, rules.as_ref(), now),
+            protocol::method::AGENT_END => {
+                let msg: protocol::AgentEnd = parse_params(raw)?;
+                note = trim_note(msg.note.as_deref());
+                self.agent_end(msg, rules.as_ref(), now)
+            }
             protocol::method::AGENT_SETTLED => {
-                self.agent_settled(parse_params(raw)?, rules.as_ref(), now)
+                let msg: protocol::AgentSettled = parse_params(raw)?;
+                note = trim_note(msg.note.as_deref());
+                self.agent_settled(msg, rules.as_ref(), now)
             }
             protocol::method::TOOL_START => {
                 self.tool_start(parse_params(raw)?, rules.as_ref(), now)
@@ -232,7 +241,7 @@ impl Session {
         // 不该把主人从桌子那头叫过来。
         if outcome.is_ok() {
             if let Some(kind) = kind {
-                self.queue_alert(kind, rules.as_ref());
+                self.queue_alert(kind, rules.as_ref(), note.as_deref());
             }
         }
         outcome
@@ -438,7 +447,11 @@ impl Session {
     ///
     /// 提醒在这里统一排队，而不是在五个 `agent_*`/`tool_*` 分支里各写一遍：
     /// 要不要提醒只取决于规则表怎么说，与事件本身怎么处理无关。
-    fn queue_alert(&mut self, kind: &str, rules: Option<&Resolution>) {
+    ///
+    /// `note` 是宿主为这条通知准备的一句话（`agent/settled` / `agent/end` 的可选参数）。
+    /// 包里写了 `alert.text` 就听包的，没写才轮到它：与 `arbiter::on_tool_start` 里
+    /// 「规则气泡优先于宿主文字」是同一套优先序。
+    fn queue_alert(&mut self, kind: &str, rules: Option<&Resolution>, note: Option<&str>) {
         let Some(spec) = rules.and_then(|rules| rules.alert.clone()) else {
             return;
         };
@@ -446,9 +459,10 @@ impl Session {
         if spec.is_inert() {
             return;
         }
-        let body = alert_body(kind, rules);
-        log::info!("规则命中提醒：{kind}（{body}）");
-        self.alerts.push(Request::new(spec, ALERT_TITLE, body));
+        let title = alert_title(spec.title.as_deref());
+        let body = alert_body(kind, rules, note);
+        log::info!("规则命中提醒：{kind}（{title} / {body}）");
+        self.alerts.push(Request::new(spec, title, body));
     }
 
     /// 重算指令，只在真正变化时推送。
@@ -464,19 +478,64 @@ impl Session {
 
 /// 系统通知的标题。
 ///
-/// 宠物包不提供标题，所以用一个固定名。它不需要区分是谁发的：
-/// 通知中心里能认出来源就够了，而包里多一个标题字段只是多一个会写错的地方。
+/// 包里写了 `alert.title` 就用它，没写就用这个固定名。它不需要区分是谁发的：
+/// 通知中心里能认出来源就够了。
 const ALERT_TITLE: &str = "LitePet";
+
+/// 通知正文的长度上限（按字符，不是字节）。
+///
+/// 正文的两个来源都在包外：宿主的 `note` 与气泡文字，长度不受包作者控制；
+/// 而手机推送把正文塞进 URL 路径（`crate::alert::push::BarkPusher::url`），
+/// 一段超长正文会变成一条超长 URL，在 Bark 那边直接失败。
+const ALERT_BODY_LIMIT: usize = 120;
+
+/// 标题取值：包里的 `alert.title` 优先，空白视为没写。
+fn alert_title(from_pack: Option<&str>) -> String {
+    from_pack
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(ALERT_TITLE)
+        .to_string()
+}
+
+/// 宿主为这条通知准备的一句话；没给、只有空白或不是字符串时为 `None`。
+fn trim_note(note: Option<&str>) -> Option<String> {
+    note.map(str::trim)
+        .filter(|note| !note.is_empty())
+        .map(str::to_string)
+}
 
 /// 把规则求值出的提醒排入队列。
 ///
-/// 正文优先用气泡文字：规则作者写的那句话本来就是给人看的，
-/// 而通知里空着正文比给一句废话更糟。
-fn alert_body(kind: &str, rules: Option<&Resolution>) -> String {
-    rules
+/// 正文优先序：包里的 `alert.text` → 宿主的 `note` → 气泡文字 → 事件自带的一句话。
+/// 前三项都在插值/取值后 trim 判空，空的一律继续往下落，所以
+/// 包作者写 `"text": "{note}"` 就等于把这句话让给宿主（宿主没说时插值成空串）。
+/// 写 `alert.text` 是为了让包作者能在宿主沉默时也把话说完，因此宿主退居第二；
+/// 反过来（宿主永远盖住包）会让包作者写的文案永远见不到光。
+fn alert_body(kind: &str, rules: Option<&Resolution>, note: Option<&str>) -> String {
+    let from_pack = rules
+        .and_then(|rules| rules.alert.as_ref())
+        .and_then(|spec| spec.text.as_deref());
+    let from_bubble = rules
         .and_then(|rules| rules.bubble.as_ref())
-        .map(|bubble| bubble.text.clone())
+        .map(|bubble| bubble.text.as_str());
+    [from_pack, note, from_bubble]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|text| !text.is_empty())
+        .map(|text| truncate_chars(text, ALERT_BODY_LIMIT))
         .unwrap_or_else(|| describe_event(kind).to_string())
+}
+
+/// 按字符截断，超长时以省略号收尾（省略号占其中一位）。
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(limit.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 /// 事件名 → 一句人话，用于没有气泡可借的提醒。
@@ -484,7 +543,7 @@ fn alert_body(kind: &str, rules: Option<&Resolution>) -> String {
 /// 名字与 [`crate::protocol::rule_event`] 给出的规则事件名一一对应。
 fn describe_event(kind: &str) -> &'static str {
     match kind {
-        "agent.settled" => "这一轮干完了",
+        "agent.settled" => "本轮会话结束",
         "agent.start" => "开始干活了",
         "agent.end" => "一轮结束",
         "tool.start" => "开始执行工具",
@@ -1064,5 +1123,125 @@ mod tests {
         send(&mut session, protocol::method::HOST_HELLO, hello("pi"), now);
         // 不给 tick 线程睡死的可能。
         assert!(session.next_deadline(now) <= Duration::from_secs(1));
+    }
+
+    /// 一份「整轮结束就提醒」的规则表，用来验提醒正文的四级链。
+    fn alerting_rules(alert: Value) -> Value {
+        json!({
+            "schemaVersion": 1,
+            "behavior": {
+                "idleTimeoutMs": 90_000,
+                "groups": {
+                    "idle": ["idle"],
+                    "working": ["working"],
+                    "resting": ["rest_tea"],
+                    "feedback": ["celebrate", "sad"]
+                },
+                "rules": [
+                    { "on": "agent.settled", "play": "celebrate", "alert": alert }
+                ]
+            }
+        })
+    }
+
+    fn alerting_session(alert: Value) -> Session {
+        Session::new(Setup {
+            pet_id: "xunjian-miao".to_string(),
+            known: known(),
+            litepet: Some(alerting_rules(alert)),
+        })
+        .expect("应能构造会话")
+    }
+
+    /// 只有一条提醒，且已经打完招呼。
+    fn settled_alerts(alert: Value, settled: Value) -> Vec<Request> {
+        let now = Instant::now();
+        let mut session = alerting_session(alert);
+        send(&mut session, protocol::method::HOST_HELLO, hello("pi"), now);
+        let _ = session.take_alerts();
+        send(&mut session, protocol::method::AGENT_SETTLED, settled, now);
+        session.take_alerts()
+    }
+
+    /// 包里没写 `alert.text` 时，宿主推来的那句话就是通知正文。
+    #[test]
+    fn host_note_becomes_the_alert_body() {
+        let alerts = settled_alerts(
+            json!({ "sound": "@done", "desktop": true }),
+            json!({ "host": "pi", "sessionId": "s1", "note": "改了三个文件，测试全绿" }),
+        );
+        assert_eq!(alerts.len(), 1, "应产生一条提醒");
+        assert_eq!(alerts[0].body, "改了三个文件，测试全绿");
+        assert_eq!(alerts[0].title, "LitePet", "没写标题就用应用名");
+    }
+
+    /// 宿主不说话且包里没写 `alert.text` 时，落回事件自带的那句话。
+    #[test]
+    fn alert_body_falls_back_to_the_event_sentence() {
+        let alerts = settled_alerts(
+            json!({ "sound": "@done", "desktop": true }),
+            json!({ "host": "pi", "sessionId": "s1" }),
+        );
+        assert_eq!(alerts[0].body, "本轮会话结束");
+    }
+
+    /// 包里写了 `alert.text` 就听包的：宿主退居第二（与 `on_tool_start` 的优先序一致）。
+    #[test]
+    fn pack_alert_text_wins_over_the_host_note() {
+        let alerts = settled_alerts(
+            json!({ "text": "巡检喵提醒你本轮结束了", "title": "巡检喵", "desktop": true }),
+            json!({ "host": "pi", "note": "宿主的话" }),
+        );
+        assert_eq!(alerts[0].body, "巡检喵提醒你本轮结束了");
+        assert_eq!(alerts[0].title, "巡检喵");
+    }
+
+    /// 正文要有长度上限：手机推送把它塞进 URL 路径，超长就发不出去。
+    #[test]
+    fn overlong_body_is_truncated() {
+        let long = "一".repeat(ALERT_BODY_LIMIT + 40);
+        let alerts = settled_alerts(
+            json!({ "text": "{note}", "desktop": true }),
+            json!({ "host": "pi", "note": long }),
+        );
+        let body = &alerts[0].body;
+        assert_eq!(body.chars().count(), ALERT_BODY_LIMIT, "超长正文应截到上限");
+        assert!(body.ends_with('…'), "截断处应有省略号：{body}");
+    }
+
+    /// 包里写 `"text": "{note}"` 等于把这句话让给宿主；宿主没说则插值成空、继续往下落。
+    #[test]
+    fn empty_pack_text_falls_through_to_the_default() {
+        let alerts = settled_alerts(
+            json!({ "text": "{note}", "desktop": true }),
+            json!({ "host": "pi" }),
+        );
+        assert_eq!(alerts[0].body, "本轮会话结束");
+    }
+
+    /// 三级包内来源都没有（没写 `alert.text`、宿主也没说话）时借气泡文字。
+    #[test]
+    fn bubble_text_is_the_third_supplier() {
+        use crate::alert::AlertSpec;
+        use crate::behavior::BubbleSpec;
+        use crate::protocol::BubbleKind;
+
+        let rules = Resolution {
+            play: None,
+            bubble: Some(BubbleSpec {
+                kind: BubbleKind::Status,
+                text: "巡检完成".to_string(),
+            }),
+            alert: Some(AlertSpec {
+                text: None,
+                ..AlertSpec::default()
+            }),
+        };
+        assert_eq!(alert_body("agent.settled", Some(&rules), None), "巡检完成");
+        // 宿主说了话就轮到宿主，气泡还在后面。
+        assert_eq!(
+            alert_body("agent.settled", Some(&rules), Some("宿主的话")),
+            "宿主的话"
+        );
     }
 }

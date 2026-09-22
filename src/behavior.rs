@@ -90,6 +90,9 @@ fn fallback_spec(sound: &str) -> AlertSpec {
         sound: Some(sound.to_string()),
         desktop: true,
         push: true,
+        // 正文由事件自带的那句话充当（见 `session::describe_event`）。
+        text: None,
+        title: None,
     }
 }
 
@@ -302,6 +305,14 @@ impl Behavior {
                 alert: fallback_alert(event),
             };
         };
+        // `{note}` 是「宿主留给这条通知的那句话」：宿主没说就该是空串，
+        // 而不是把 `{note}` 原样发到用户手机上。其余未知字段仍然原样保留，
+        // 便于发现拼写错误（`interpolate` 的约定）。
+        let mut alert_fields = event.fields.clone();
+        if let Value::Object(map) = &mut alert_fields {
+            map.entry("note")
+                .or_insert_with(|| Value::String(String::new()));
+        }
         rules
             .iter()
             .find(|rule| rule_matches(rule, event))
@@ -311,7 +322,17 @@ impl Behavior {
                     kind: spec.kind,
                     text: interpolate(&spec.text, &event.fields),
                 }),
-                alert: rule.alert.clone(),
+                alert: rule.alert.as_ref().map(|spec| AlertSpec {
+                    text: spec
+                        .text
+                        .as_deref()
+                        .map(|text| interpolate(text, &alert_fields)),
+                    title: spec
+                        .title
+                        .as_deref()
+                        .map(|title| interpolate(title, &alert_fields)),
+                    ..spec.clone()
+                }),
             })
             .unwrap_or_default()
     }
@@ -656,6 +677,55 @@ mod tests {
         let behavior = rules_behavior();
         let event = Event::new("bubble", json!({ "text": "hi" }));
         assert_eq!(behavior.resolve(&event), Resolution::default());
+    }
+
+    /// `alert.text` 支持插值，与气泡同一套规则。
+    #[test]
+    fn alert_text_and_title_are_interpolated() {
+        let behavior = Behavior::new(
+            Some(&litepet(json!({
+                "rules": [{
+                    "on": "agent.settled",
+                    "alert": {
+                        "text": "{note}",
+                        "title": "来自 {host}"
+                    }
+                }]
+            }))),
+            &known(),
+        )
+        .expect("应能构造");
+        let alert = behavior
+            .resolve(&Event::new(
+                "agent.settled",
+                json!({ "host": "pi", "note": "改了三个文件" }),
+            ))
+            .alert
+            .expect("应有提醒");
+        assert_eq!(alert.text.as_deref(), Some("改了三个文件"));
+        assert_eq!(alert.title.as_deref(), Some("来自 pi"));
+    }
+
+    /// 宿主没给 `note` 时，`{note}` 该插成空串而不是把占位符发到用户手机上；
+    /// 其余未知字段仍然原样保留（那是发现拼写错误的手段）。
+    #[test]
+    fn missing_note_interpolates_to_empty_but_typos_stay() {
+        let behavior = Behavior::new(
+            Some(&litepet(json!({
+                "rules": [{
+                    "on": "agent.settled",
+                    "alert": { "text": "[{note}]", "title": "{hostt}" }
+                }]
+            }))),
+            &known(),
+        )
+        .expect("应能构造");
+        let alert = behavior
+            .resolve(&Event::new("agent.settled", json!({ "host": "pi" })))
+            .alert
+            .expect("应有提醒");
+        assert_eq!(alert.text.as_deref(), Some("[]"));
+        assert_eq!(alert.title.as_deref(), Some("{hostt}"));
     }
 
     #[test]
