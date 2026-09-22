@@ -36,4 +36,4 @@ Copyright (c) Mario Zechner
 Source:  https://github.com/badlogic/pi-mono
 License: MIT
 
-The `adapters/pi` extension targets the pi coding agent extension API.
+The `pi-plugins-litepet` extension targets the pi coding agent extension API.

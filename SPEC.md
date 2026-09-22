@@ -44,7 +44,7 @@
 | 组件 | 产物 | 归属 |
 |---|---|---|
 | litepet | Tauri App（.app/.dmg） | **本仓库**（服务端 + 协议契约） |
-| pi 适配器 | 单文件 `pet.ts` 放 `~/.pi/agent/extensions/` | **独立定义、独立发版，不在本仓库** |
+| pi 插件 | pi 插件包（`pi-plugins-litepet`） | **独立仓库、独立发版，不在本仓库** |
 | dsh 适配器 | dsh plugin bundle | **独立定义、独立发版，不在本仓库** |
 
 **本仓库只交付 daemon 与协议定义**：`docs/PROTOCOL.md` 是唯一契约。宿主侧适配器由宿主方各自实现，本仓库不含参考实现。协议中立（§0 约束 1）既是架构约束，也是交付边界。
@@ -363,7 +363,7 @@ L3 是唯一能把 §3.4 「策略逻辑要手写 Rust」这条成本压下去�
 |---|---|---|
 | M0 | 仓库初始化 + 本文档入库 + 协议 v1 定稿 | `docs/PROTOCOL.md` 与本文 §2 一致；CI（fmt/clippy/build）跑通 |
 | M1 | Tauri daemon：透明窗 + animated WebP 播放 + HTTP server + 状态机最小版 | `node scripts/host-sim.mjs` 演完整会话：宠物切打字动画 → 出气泡 → `agent/end` 后举杠铃 → 道别后 linger 30s 退出并删掉 `daemon.json`；二次启动检测单例 |
-| M2 | 协议层可被真实宿主驱动（本仓库只做到这一步） | `node scripts/host-sim.mjs` 演完整会话全部通过；“宿主侧适配器”已移出本仓库，另在独立仓库验收（`~/tools/litepet-adapter-ts`） |
+| M2 | 协议层可被真实宿主驱动（本仓库只做到这一步） | `node scripts/host-sim.mjs` 演完整会话全部通过；宿主插件已作为独立项目实现（`pi-plugins-litepet`）并在实机完整验收 |
 | M3 | 点击穿透 + 拖拽/缩放/右键菜单 + 位置持久化 | 宠物不挡下层点击；点中宠物可拖可缩；重启后位置保留。**进度：拖拽移动、位置持久化（含跨屏缩放修正）与托盘「回到主屏」已完成；点击穿透、缩放、右键菜单未做** |
 | M4 | dsh 适配器（独立仓库） | 与 M2 同标准在 dsh 上验收；pi+dsh 同时跑时仲裁与徽章正确 |
 | M5 | 打磨：省电、气泡换肤 JSON、`--resident`、登录自启、dmg 打包 | 手工清单逐项过 |
