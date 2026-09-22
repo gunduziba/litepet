@@ -23,6 +23,7 @@ use serde_json::Value;
 use tiny_http::{Header, Method, Request, Response as HttpResponse, Server, StatusCode};
 
 use crate::alert::Request as AlertRequest;
+use crate::config::AuthGate;
 use crate::jsonrpc::{self, ErrorObject, Response as JsonResponse};
 use crate::protocol::DisplayDirective;
 use crate::session::{Outcome, Session};
@@ -37,6 +38,10 @@ const WORKERS: usize = 4;
 const POLL: Duration = Duration::from_millis(500);
 /// 探测已有实例的超时；回环连接不需要久等。
 const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+/// 鉴权没过时的应答。
+const UNAUTHORIZED_REASON: &str = "缺少或错误的 Authorization: Bearer <token>";
+/// token 配得用不了时的应答：说清楚问题在 daemon 这边，不在宿主那边。
+const LOCKED_REASON: &str = "daemon 的 config.json 里 auth.token 含空白或非 ASCII 字符，这个值永远配不上，所有请求都被拒绝；请改成可见 ASCII 口令，或清空它表示不鉴权";
 
 /// 由调用方注入的副作用出口。
 ///
@@ -44,8 +49,12 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 pub struct Hooks {
     /// 会话产生了新指令。
     pub display: Box<dyn Fn(DisplayDirective) + Send + Sync>,
-    /// 会话要求退出进程。
-    pub exit: Box<dyn Fn() + Send + Sync>,
+    /// 当前登记的宿主数；`0` 表示没人连了。
+    ///
+    /// 桌宠靠它决定要不要把自己收进托盘（没人连的时候藏起来）。
+    /// 每次推进（一个请求或一拍空转）都会报一次，实现方得自己认「变化」，
+    /// 否则用户刚从托盘点出来的宠物会被下一拍空转立刻藏回去。
+    pub hosts: Box<dyn Fn(usize) + Send + Sync>,
     /// 会话排出了一条待发提醒。
     ///
     /// 回调必须**立刻返回**：它跑在 HTTP 工作线程上，而发提醒本身可能很慢
@@ -98,8 +107,8 @@ pub trait Daemon: Send + Sync {
 pub struct Shared {
     /// 会话状态，宿主事件都写它。
     pub sessions: Arc<Mutex<Session>>,
-    /// 请求鉴权用的 token。
-    pub token: String,
+    /// `POST /rpc` 的准入策略；由 `config.json` 的 `auth.token` 空不空决定。
+    pub gate: AuthGate,
     /// 渲染与提醒的出口。
     pub hooks: Arc<Hooks>,
     /// daemon 级方法的出口。
@@ -146,7 +155,7 @@ pub fn serve(server: Server, shared: Arc<Shared>) {
 
 /// 空转线程：按 [`Session::next_deadline`] 的节奏推进时间。
 ///
-/// 气泡过期、进入 `resting`、linger 退出、回收死宿主都只依赖时间，
+/// 气泡过期、进入 `resting`、回收死宿主都只依赖时间，
 /// 没有任何请求会来触发它们，所以必须有一个自己的时钟。
 fn spawn_ticker(sessions: Arc<Mutex<Session>>, hooks: Arc<Hooks>) {
     std::thread::spawn(move || loop {
@@ -158,16 +167,14 @@ fn spawn_ticker(sessions: Arc<Mutex<Session>>, hooks: Arc<Hooks>) {
             }
         };
         std::thread::sleep(deadline);
-        let outcome = match sessions.lock() {
-            Ok(mut session) => session.tick(Instant::now()),
+        let (outcome, hosts) = match sessions.lock() {
+            Ok(mut session) => {
+                let outcome = session.tick(Instant::now());
+                (outcome, session.host_count())
+            }
             Err(_) => return,
         };
-        // 退出是终态：请完退出就停表，不再空转。
-        let retiring = matches!(outcome, Outcome::Exit);
-        publish(outcome, &hooks);
-        if retiring {
-            return;
-        }
+        publish(outcome, hosts, &hooks);
     });
 }
 
@@ -181,8 +188,17 @@ fn handle(mut request: Request, shared: &Shared) {
         respond_text(request, 405, &format!("仅支持 POST {RPC_PATH}"));
         return;
     }
-    if !authorized(&request, &shared.token) {
-        respond_text(request, 401, "缺少或错误的 Authorization: Bearer <token>");
+    // 借用在这里算完，后面 `respond_text` 要拿走 `request`。
+    let verdict = {
+        let presented = request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv("Authorization"))
+            .map(|header| header.value.as_str());
+        admit(&shared.gate, presented)
+    };
+    if let Err((status, reason)) = verdict {
+        respond_text(request, status, reason);
         return;
     }
     let body = match read_body(&mut request) {
@@ -220,22 +236,24 @@ fn dispatch(body: &str, shared: &Shared) -> Option<String> {
         return reply(&request, result);
     }
 
-    let (answered, alerts) = match shared.sessions.lock() {
+    let (answered, alerts, hosts) = match shared.sessions.lock() {
         Ok(mut session) => {
             let answered = session.call(&request.method, request.params.as_ref(), Instant::now());
             // 提醒必须在同一个锁里取走：放到锁外再取的话，
             // 并发的一次调用会把别人的提醒捎带出去，或者把自己的吃掉。
-            (answered, session.take_alerts())
+            let alerts = session.take_alerts();
+            (answered, alerts, session.host_count())
         }
         Err(_) => (
             Err(ErrorObject::new(jsonrpc::INTERNAL_ERROR, "会话状态已损坏")),
             Vec::new(),
+            0,
         ),
     };
 
     match answered {
         Ok(answered) => {
-            publish(answered.outcome, &shared.hooks);
+            publish(answered.outcome, hosts, &shared.hooks);
             // 提醒排在回复之后：通知渠道再慢也不该拖慢宿主拿到的响应。
             for alert in alerts {
                 (shared.hooks.alert)(alert);
@@ -310,28 +328,43 @@ fn object_params<'a>(params: Option<&'a Value>, method: &str) -> Result<&'a Valu
     })
 }
 
-/// 把会话结果推给渲染层，必要时请求退出。
-fn publish(outcome: Outcome, hooks: &Arc<Hooks>) {
+/// 把会话结果推给渲染层，并报一次当前宿主数。
+///
+/// 返回值里没有「退出」这一档：宠物是常驻的，会话层永远不会让它走。
+fn publish(outcome: Outcome, hosts: usize, hooks: &Arc<Hooks>) {
+    // 先报宿主数（要露脸就先露），再推显式指令。
+    (hooks.hosts)(hosts);
     match outcome {
         Outcome::Unchanged => {}
         Outcome::Display(directive) => (hooks.display)(*directive),
-        Outcome::Exit => (hooks.exit)(),
     }
 }
 
-/// 校验 `Authorization: Bearer <token>`。
-fn authorized(request: &Request, token: &str) -> bool {
-    request
-        .headers()
-        .iter()
-        .find(|header| header.field.equiv("Authorization"))
-        .and_then(|header| header.value.as_str().strip_prefix("Bearer "))
-        .is_some_and(|presented| constant_time_eq(presented.trim(), token))
+/// 按准入策略判定这次请求；`Err` 是要回给客户端的 (状态码, 说明)。
+///
+/// 只吃一个头值、与 HTTP 无关，所以三种策略都能直接单测。
+fn admit(gate: &AuthGate, header: Option<&str>) -> Result<(), (u16, &'static str)> {
+    match gate {
+        AuthGate::Open => Ok(()),
+        // 回 503 而不是 401：401 的意思是「你的凭据不对」，
+        // 会让人反复去检查宿主那边的 token；真正的问题在 daemon 这边没配（或配错了）。
+        AuthGate::Locked => Err((503, LOCKED_REASON)),
+        AuthGate::Token(expected) if authorized(header, expected) => Ok(()),
+        AuthGate::Token(_) => Err((401, UNAUTHORIZED_REASON)),
+    }
+}
+
+/// 校验 `Authorization: Bearer <token>`；头缺失、少了 `Bearer ` 前缀、值不符都算否。
+fn authorized(header: Option<&str>, expected: &str) -> bool {
+    header
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|presented| constant_time_eq(presented.trim(), expected))
 }
 
 /// 定长比较，避免用响应时间把 token 一位位试出来。
 ///
-/// token 本身是随机十六进制，长度不敏感，所以长度不同直接判否。
+/// 长度不同直接判否：这会把长度泄漏出去，但 token 由用户自定、长度本身不足以缩小
+/// 搜索空间，换来的是比较过程与内容无关。
 fn constant_time_eq(presented: &str, expected: &str) -> bool {
     if presented.len() != expected.len() {
         return false;
@@ -450,8 +483,8 @@ mod tests {
         shared: Arc<Shared>,
         /// 收到的动画名。
         seen: Arc<Mutex<Vec<String>>>,
-        /// 是否被要求退出。
-        exited: Arc<Mutex<bool>>,
+        /// 上报过的宿主数（按先后顺序）。
+        hosts: Arc<Mutex<Vec<usize>>>,
         /// 排出的提醒。
         alerts: Arc<Mutex<Vec<AlertRequest>>>,
         /// daemon 级方法收到的调用。
@@ -492,14 +525,14 @@ mod tests {
             self.seen.lock().expect("锁未中毒").len()
         }
 
-        /// 是否被要求退出。
-        fn exited(&self) -> bool {
-            *self.exited.lock().expect("锁未中毒")
-        }
-
         /// 排出的提醒。
         fn alerts(&self) -> Vec<AlertRequest> {
             self.alerts.lock().expect("锁未中毒").clone()
+        }
+
+        /// 上报过的宿主数。
+        fn hosts_reported(&self) -> Vec<usize> {
+            self.hosts.lock().expect("锁未中毒").clone()
         }
     }
 
@@ -512,21 +545,20 @@ mod tests {
             pet_id: "xunjian-miao".to_string(),
             known,
             litepet: None,
-            resident: true,
         })
         .expect("应能构造会话");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
-        let exited = Arc::new(Mutex::new(false));
-        let exit_flag = Arc::clone(&exited);
         let alerts = Arc::new(Mutex::new(Vec::new()));
         let alert_sink = Arc::clone(&alerts);
+        let hosts = Arc::new(Mutex::new(Vec::new()));
+        let hosts_sink = Arc::clone(&hosts);
         let hooks = Arc::new(Hooks {
             display: Box::new(move |directive| {
                 sink.lock().expect("锁未中毒").push(directive.animation);
             }),
-            exit: Box::new(move || {
-                *exit_flag.lock().expect("锁未中毒") = true;
+            hosts: Box::new(move |count| {
+                hosts_sink.lock().expect("锁未中毒").push(count);
             }),
             alert: Box::new(move |request| {
                 alert_sink.lock().expect("锁未中毒").push(request);
@@ -535,7 +567,7 @@ mod tests {
         let daemon_calls = Arc::new(Mutex::new(Vec::new()));
         let shared = Arc::new(Shared {
             sessions: Arc::new(Mutex::new(session)),
-            token: TOKEN.to_string(),
+            gate: AuthGate::Token(TOKEN.to_string()),
             hooks,
             daemon: Arc::new(TestDaemon {
                 calls: Arc::clone(&daemon_calls),
@@ -544,7 +576,7 @@ mod tests {
         Harness {
             shared,
             seen,
-            exited,
+            hosts,
             alerts,
             daemon_calls,
         }
@@ -627,6 +659,15 @@ mod tests {
         })
     }
 
+    fn bye() -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "host/bye",
+            "params": { "host": "pi" },
+            "id": 2
+        })
+    }
+
     #[test]
     fn hello_request_returns_a_jsonrpc_result() {
         let server = harness();
@@ -636,7 +677,16 @@ mod tests {
         assert_eq!(reply["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert!(reply.get("error").is_none(), "成功响应不该有 error");
         assert_eq!(server.pushed(), 1, "首帧应推一次指令");
-        assert!(!server.exited(), "打招呼不该要求退出");
+    }
+
+    /// 宿主数要推出去：桌宠靠它决定什么时候把自己收进托盘、什么时候再露回来。
+    #[test]
+    fn host_count_is_reported_after_hello_and_bye() {
+        let server = harness();
+        server.post(hello());
+        assert_eq!(server.hosts_reported().last().copied(), Some(1));
+        server.post(bye());
+        assert_eq!(server.hosts_reported().last().copied(), Some(0));
     }
 
     #[test]
@@ -692,6 +742,44 @@ mod tests {
         // 只差最后一位也必须判否。
         let almost = format!("{}0", &TOKEN[..TOKEN.len() - 1]);
         assert!(!constant_time_eq(&almost, TOKEN));
+    }
+
+    /// 关掉鉴权后，任何请求都不再需要 `Authorization` 头。
+    #[test]
+    fn open_gate_admits_without_any_header() {
+        assert!(admit(&AuthGate::Open, None).is_ok(), "没填 token 时缺头也要放行");
+        assert!(admit(&AuthGate::Open, Some("Bearer 随便什么")).is_ok());
+    }
+
+    /// 开着鉴权却没有可用 token 时，**谁都进不来**。
+    ///
+    /// 这条行钉住一个真实的坑：空 token 不能当口令用。
+    /// `Authorization: Bearer `（后面什么都没有）会被 `strip_prefix` + `trim`
+    /// 变成空串，若拿它去和空 token 比就通过了——那是「看起来设了防、
+    /// 其实谁都能进」，比不设防更坏。所以这里连同状态码一起钉死。
+    #[test]
+    fn locked_gate_admits_nobody() {
+        for header in [None, Some("Bearer "), Some("Bearer anything")] {
+            let err = admit(&AuthGate::Locked, header).expect_err("不该放行任何请求");
+            assert_eq!(err.0, 503, "该报「服务不可用」而不是「凭据不对」");
+        }
+    }
+
+    /// 开着鉴权时，缺头、少前缀、值不对一律不放行。
+    #[test]
+    fn token_gate_needs_the_exact_bearer() {
+        let gate = AuthGate::Token(TOKEN.to_string());
+        assert!(admit(&gate, Some(&format!("Bearer {TOKEN}"))).is_ok());
+        assert!(
+            admit(&gate, Some(&format!("Bearer  {TOKEN} "))).is_ok(),
+            "两头多余空白应当容忍"
+        );
+        assert_eq!(admit(&gate, None).expect_err("缺头").0, 401);
+        assert_eq!(admit(&gate, Some("Bearer wrong")).expect_err("值不对").0, 401);
+        assert_eq!(
+            admit(&gate, Some(TOKEN)).expect_err("少 `Bearer ` 前缀").0,
+            401
+        );
     }
 
     #[test]

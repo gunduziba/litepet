@@ -2122,7 +2122,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "getrandom 0.3.4",
  "log",
  "rodio",
  "serde",

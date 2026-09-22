@@ -22,10 +22,25 @@
 | 方法 | 仅 `POST`；其他方法回 `405` |
 | 路径 | 仅 `/rpc`；其他路径回 `404` |
 | `Content-Type` | `application/json` |
-| 鉴权 | `Authorization: Bearer <token>`，缺失或错误回 `401` |
+| 鉴权 | `Authorization: Bearer <token>`，缺失或错误回 `401`；`auth.token` 为空时不要求任何头 |
 | 请求体上限 | 64 KiB，超出回 `413` |
 
-token 是启动时随机生成的 32 位十六进制串（128 位熵），与端口一起写在端点文件里。
+token **由用户自己定**，写在 `config.json` 的 `auth` 段里；daemon 不生成、不轮换。
+这一段只有 `token` 一个字段——**填了就要鉴权，留空就不鉴权**，没有单独的开关：
+
+```jsonc
+// ~/.litepet/config.json
+"auth": {
+  "token": "my-own-secret-123"  // 留空 = 不鉴权
+}
+```
+
+- 早先的做法是启动时随机生成 32 位十六进制串。改掉了：那要求宿主每次重启都回去重读端点文件，用户配好的值重启一次就没了。
+- 再后来同时有过 `enabled` 开关和 `token` 两个字段。删掉了：`token` 空不空已经能表达「要不要鉴权」，多一个开关就多出一种自相矛盾的摆法（开着鉴权却没填 token），而那种摆法还得另外规定算哪边。
+- 缺省（含升级上来的老配置）是空 token，即**不鉴权**。所以「没设防」这个状态会在启动日志里 `warn` 出来，设置页上也当场写着「本机谁都能连」。
+- token 配得用不了（含空白或非 ASCII 字符）时，daemon **不拒绝启动**、也不退回不鉴权，而是**一个请求都不放**（回 `503`，理由写在响应里）。不拒绝启动：鉴权只管 `POST /rpc` 的准入，跟窗口、托盘、宠物渲染无关。不退回不鉴权：那是静悄悄地把接口敲开，而用户会以为自己已经设了防。
+- token 只能用**可见 ASCII**。`Authorization` 头里出现非 ASCII 或空白字节，请求会连 `401` 都拿不到、而是被直接掐断连接（实测 curl 退出码 52），所以这种值在启动时就被拦下。
+- 不鉴权的代价要清楚：接口仍只绑回环，但**同机上任何程序都能连**，包括你正在浏览的网页（浏览器向 `localhost` 发简单请求可以绕过 CORS 预检）。
 
 ### 1.1 端点发现
 
@@ -35,10 +50,11 @@ daemon 在**端口绑定成功之后**写出端点文件，宿主读它拿端口
 |---|---|
 | 路径 | `$LITEPET_HOME/daemon.json`，未设时回退 `~/.litepet/daemon.json` |
 | 权限 | `0600`（只允许当前用户读，避免同机其他用户拿到 token） |
-| 内容 | `{"protocolVersion": 1, "port": 4590, "token": "<32 位十六进制>"}` |
+| 内容 | `{"protocolVersion": 1, "port": 4590, "token": "<用户自定的口令，不鉴权时为空串>"}` |
 
 - daemon **正常退出时删除**该文件；进程被 `kill -9` 会留下陈旧文件，宿主应先尝试连接再决定是否重试
-- 宿主**不该缓存**端口与 token：每次启动重新读文件
+- 宿主**不该缓存**端口：文件正常退出时会被删掉、下次启动重写。token 在多次启动之间是稳定的，但同样从这份文件读最省事——它就在旁边
+- 宿主判「能不能连」只看 `port` 是不是数字，**不要按 token 的真值判**：不鉴权时它是空串，按真值判会把正常状态误报成「文件残缺」
 - 文件出现即代表可以连了，宿主侧推荐「轮询文件出现」而不是「盲等固定秒数」
 
 ### 1.2 为什么不用 Unix domain socket
@@ -221,7 +237,8 @@ idle ──agent.start──► working ──agent.end(success)──► celebr
 
 - daemon 启动即绑定回环端口；端口被占用视为「已有实例在跑」，新进程直接退出（单例）
 - 绑定成功后写 `daemon.json`；退出时删除它
-- 所有宿主注销 → linger **30 秒**（可配 `--resident` 常驻）→ 退出
+- 所有宿主注销 → daemon **继续常驻**（不退出）：宠物窗口收进托盘，托盘菜单「显示宠物」可以再点出来；只有用户从托盘选「退出」才结束进程
+- `--resident` 仍收但已无作用（宠物本来就是常驻的），保留只为不弄坏已有脚本
 - 宿主侧原则：进程启动时读 `daemon.json` + `host/hello`；退出时尽量发一条 `host/bye`（**发了能让宠物立刻回 idle，不发也只是等 60s 超时**）
 - 宿主重启：重新读 `daemon.json`（端口可能变了），重新 `host/hello`
 
@@ -283,7 +300,7 @@ idle ──agent.start──► working ──agent.end(success)──► celebr
 ```bash
 node scripts/host-sim.mjs --host pi --step 800     # 演完整会话，每步间隔 800ms
 node scripts/host-sim.mjs --step 0                 # 一口气跑完
-node scripts/host-sim.mjs --keep-alive             # 演完保持心跳，观察 linger
+node scripts/host-sim.mjs --keep-alive             # 演完保持心跳，观察宿主不掉线
 ```
 
 手工注入用 `curl`（token 与端口从端点文件读）：
@@ -314,7 +331,7 @@ curl -s -w "%{http_code}\n" -X POST "$RPC" -H "Authorization: Bearer $TOKEN" -d 
 >
 > `curl` 也无法控制事件间隔（一次发一条），动作会一闪而过，要观察节奏就用模拟器。
 
-预期：切「打字」→ 出气泡 → `agent/end` 举杠铃 → 之后 30s 无宿主 → daemon 退出并删掉 `daemon.json`。
+预期：切「打字」→ 出气泡 → `agent/end` 举杠铃 → 道别后 daemon **不退出**：宠物收进托盘（`日志里出现「宿主全部断开，宠物收进托盘」`），进程还在，`daemon.json` 也还在。
 
 > 验证渲染层是否真的收到了指令，看 daemon 的 stdout：每应用一条都会打
 > `渲染层已应用 动画=... 气泡=...`。webview 的 console 在终端里看不到，

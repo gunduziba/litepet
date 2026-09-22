@@ -43,6 +43,9 @@
     ],
     "category": "Entertainment",
     "license": "Apache-2.0",
+    "resources": {
+      "assets/pets": "pets"
+    },
     "shortDescription": "统一的桌面宠物",
     "longDescription": "LitePet 是一个桌面宠物 daemon：pi 与 dsh 通过 HTTP + JSON-RPC 驱动它显示宠物与提醒。窗口常驻桌面，提醒通道（音效 / 系统通知 / 手机推送）由宠物包的规则表决定。",
     "macOS": {

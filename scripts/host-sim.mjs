@@ -82,8 +82,10 @@ async function waitForEndpoint(file, timeoutMs) {
     try {
       const raw = fs.readFileSync(file, 'utf8');
       const parsed = JSON.parse(raw);
-      if (parsed.port && parsed.token) return parsed;
-      lastError = '文件里缺 port 或 token';
+      // token 允许是空串：那是配置里 `auth.token` 为空（不鉴权），
+      // 不是文件残缺。按真值判断会把「不鉴权」误报成「文件里缺 token」。
+      if (typeof parsed.port === 'number' && typeof parsed.token === 'string') return parsed;
+      lastError = '文件里缺 port 或 token 字段';
     } catch (err) {
       lastError = err.message;
     }
@@ -109,12 +111,14 @@ class RpcClient {
       body.id = this.nextId;
       this.nextId += 1;
     }
+    const headers = { 'Content-Type': 'application/json' };
+    // 不鉴权时 token 是空串，不发 `Authorization` 头。
+    // 发一个 `Bearer ` 出去虽然也会被放行（daemon 那边直接不看这个头），
+    // 但会让抓包和日志里多出一个假的凭据，误导以后查问题的人。
+    if (this.token) headers.Authorization = `Bearer ${this.token}`;
     const response = await fetch(this.url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.token}`,
-      },
+      headers,
       body: JSON.stringify(body),
     });
     const text = await response.text();
@@ -148,7 +152,7 @@ async function main() {
   --host        宿主标识（默认 ${DEFAULT_HOST}）
   --step        每步间隔毫秒（默认 ${DEFAULT_STEP_MS}；设 0 可快速跑完）
   --wait        等对接信息出现的超时毫秒（默认 ${DEFAULT_WAIT_MS}）
-  --keep-alive  演完后保持心跳，直到 Ctrl-C（用于观察 linger 行为）
+  --keep-alive  演完后保持心跳，直到 Ctrl-C（用于观察宿主不掉线时的表现）
 
 对接信息文件：${endpointFile}
 `);
@@ -244,7 +248,7 @@ async function main() {
     return;
   }
 
-  console.log('道别（daemon 应立即注销本宿主，进入 linger）');
+  console.log('道别（daemon 应立即注销本宿主）');
   await notify(METHOD.hostBye, { host, reason: '模拟器收工' });
 }
 

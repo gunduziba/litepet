@@ -1,0 +1,8 @@
+{
+  "id": "xunjian-miao",
+  "displayName": "巡检喵",
+  "description": "机警又耐心的黑猫巡检员，陪你定位根因、审查改动、守护每一次交付。",
+  "spritesheetPath": "spritesheet.webp",
+  "spriteVersionNumber": 2,
+  "kind": "animal"
+}

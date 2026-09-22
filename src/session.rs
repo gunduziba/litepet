@@ -1,14 +1,13 @@
-//! 会话层：把 JSON-RPC 方法调用变成渲染指令，并负责 daemon 的生命周期（linger 退出）。
+//! 会话层：把 JSON-RPC 方法调用变成渲染指令。
 //!
-//! 这一层是唯一知道「协议方法 × 宠物包规则 × 仲裁器」三者关系的地方，
-//! 因此它是接进 Tauri 前最后一层可单测的逻辑（不碰网络、不碰 UI）。
+//! 这一层并不决定 daemon 的存亡：桌宠是常驻的，会话层只负责「该显示什么」。
 //!
 //! 调用方（HTTP 服务层）只需三步：
 //! 1. 加锁拿到 `Session`；
 //! 2. [`Session::call`] 得到一个 [`Answered`]；
 //! 3. 把 `outcome` 推给渲染层、把 `result` 写回 HTTP 响应。
 //!
-//! 与具体请求无关的空转（气泡过期、进入 `resting`、linger 到期、回收死宿主）
+//! 与具体请求无关的空转（气泡过期、进入 `resting`、回收死宿主）
 //! 走 [`Session::tick`]，由后台线程按 [`Session::next_deadline`] 的节奏驱动。
 
 use std::collections::{BTreeSet, HashMap};
@@ -29,9 +28,6 @@ use crate::protocol::{
     PingParams, ToolEnd, ToolStart,
 };
 
-/// 全部宿主注销后，daemon 继续存活多久（`docs/PROTOCOL.md` §8）。
-pub const LINGER: Duration = Duration::from_secs(30);
-
 /// 建议宿主发送 `daemon/ping` 的间隔（`docs/PROTOCOL.md` §2）。
 ///
 /// HTTP 无连接，心跳是唯一的存活信号；建议间隔必须明显小于 [`HOST_TIMEOUT`]。
@@ -49,8 +45,6 @@ pub struct Setup {
     pub known: BTreeSet<String>,
     /// `pet.json` 里 `litepet` 扩展键的原值；`None` 表示纯 Codex 包。
     pub litepet: Option<Value>,
-    /// 常驻模式：永不由 linger 触发退出。
-    pub resident: bool,
 }
 
 /// 处理一条消息或一次空转的结果。
@@ -60,8 +54,6 @@ pub enum Outcome {
     Unchanged,
     /// 需要推给渲染层。
     Display(Box<DisplayDirective>),
-    /// 应该退出进程。
-    Exit,
 }
 
 /// 一次方法调用的结果。
@@ -81,19 +73,10 @@ pub struct Session {
     behavior: Behavior,
     /// 该包声明的动画名集合。
     known: BTreeSet<String>,
-    /// 「全部宿主已断开」的起点；`None` 表示当前有宿主，或还没有宿主连过。
-    empty_since: Option<Instant>,
-    /// 常驻模式：永不由 linger 触发退出。
-    resident: bool,
     /// 当前宠物包 id，用于回答 `daemon/info`。
     pet_id: String,
     /// 上一次推送的指令，用于去重。
     last: Option<DisplayDirective>,
-    /// 已经上报过退出。
-    ///
-    /// 退出是终态：主循环收到 `Exit` 后还要跑几拍才能真正结束进程，
-    /// 没这个标志就会把「该退出了」反复上报、反复打日志。
-    retired: bool,
     /// 待发提醒。会话层只负责「攒」，发送是 `main` 的事。
     ///
     /// 提醒可能很慢（要起子进程判定人在不在、要出网推手机），
@@ -117,11 +100,8 @@ impl Session {
             arbiter: Arbiter::new(),
             behavior,
             known: setup.known,
-            empty_since: None,
-            resident: setup.resident,
             pet_id: setup.pet_id,
             last: None,
-            retired: false,
             alerts: Vec::new(),
             last_end: HashMap::new(),
         })
@@ -180,13 +160,10 @@ impl Session {
         })
     }
 
-    /// 空闲时推进时间：回收死宿主、气泡过期、反馈结束、进入 `resting`、linger 到期。
+    /// 空闲时推进时间：回收死宿主、气泡过期、反馈结束、进入 `resting`。
     ///
-    /// 一旦上报过 `Exit`，后续空转一律返回 `Unchanged`。
+    /// 这里**不会**因为「没有宿主」而结束进程：宠物是常驻的，宿主来去都不影响它。
     pub fn tick(&mut self, now: Instant) -> Outcome {
-        if self.retired {
-            return Outcome::Unchanged;
-        }
         let reaped = self.arbiter.reap_dead(now, HOST_TIMEOUT);
         for host in &reaped {
             log::info!(
@@ -196,28 +173,13 @@ impl Session {
         }
         if !reaped.is_empty() {
             log::info!("当前宿主 {} 个", self.host_count());
-            self.begin_linger_if_empty(now);
-        }
-
-        if self.linger_expired(now) {
-            log::info!("已无宿主连接满 {}s，退出", LINGER.as_secs());
-            self.retired = true;
-            return Outcome::Exit;
         }
         self.refresh(now)
     }
 
     /// 距离下一次必须空转还差多久。
     pub fn next_deadline(&self, now: Instant) -> Duration {
-        let mut next = self.arbiter.next_deadline(now, &self.behavior);
-        if let Some(since) = self.empty_since {
-            if !self.resident {
-                let remaining = LINGER.saturating_sub(now.saturating_duration_since(since));
-                if remaining < next {
-                    next = remaining;
-                }
-            }
-        }
+        let next = self.arbiter.next_deadline(now, &self.behavior);
         // 兜底：即使这一层判不出任何变化，也别让 tick 线程睡死。
         // 死宿主的回收精度也因此不会差于 1s。
         next.min(Duration::from_secs(1))
@@ -246,7 +208,7 @@ impl Session {
 
         let outcome = match method {
             protocol::method::HOST_HELLO => self.hello(parse_params(raw)?, now),
-            protocol::method::HOST_BYE => self.bye(parse_params(raw)?, now),
+            protocol::method::HOST_BYE => self.bye(parse_params(raw)?),
             protocol::method::DAEMON_PING => self.ping(parse_params(raw)?),
             protocol::method::AGENT_START => {
                 self.agent_start(parse_params(raw)?, rules.as_ref(), now)
@@ -305,7 +267,6 @@ impl Session {
         // 重连也算新会话：上一轮遗留的「结局」不能拿来解释新一轮的 `agent/settled`。
         self.last_end.remove(&msg.host);
         log::info!("当前宿主 {} 个", self.host_count());
-        self.empty_since = None;
         Ok(protocol::hello_result(
             env!("CARGO_PKG_VERSION"),
             &self.pet_id,
@@ -313,7 +274,7 @@ impl Session {
     }
 
     /// `host/bye`：宿主正常退出。
-    fn bye(&mut self, msg: HostBye, now: Instant) -> Result<Value, ErrorObject> {
+    fn bye(&mut self, msg: HostBye) -> Result<Value, ErrorObject> {
         log::info!(
             "宿主 {} 已断开{}",
             msg.host,
@@ -321,7 +282,6 @@ impl Session {
         );
         self.arbiter.unregister(&msg.host);
         log::info!("当前宿主 {} 个", self.host_count());
-        self.begin_linger_if_empty(now);
         Ok(Value::Null)
     }
 
@@ -461,7 +421,6 @@ impl Session {
             "daemonVersion": env!("CARGO_PKG_VERSION"),
             "petId": self.pet_id,
             "hostCount": self.arbiter.host_count(),
-            "resident": self.resident,
             "pingIntervalMs": PING_INTERVAL.as_millis() as u64,
             "hostTimeoutMs": HOST_TIMEOUT.as_millis() as u64,
         }))
@@ -502,21 +461,6 @@ impl Session {
         Outcome::Display(Box::new(directive))
     }
 
-    /// 没有宿主了就启动 linger 倒计时。
-    fn begin_linger_if_empty(&mut self, now: Instant) {
-        if self.arbiter.is_empty() {
-            self.empty_since = Some(now);
-        }
-    }
-
-    /// linger 是否已到期——即「该退出了」。
-    fn linger_expired(&self, now: Instant) -> bool {
-        if self.resident {
-            return false;
-        }
-        self.empty_since
-            .is_some_and(|since| now.saturating_duration_since(since) >= LINGER)
-    }
 }
 
 /// 系统通知的标题。
@@ -636,7 +580,6 @@ mod tests {
             pet_id: "xunjian-miao".to_string(),
             known: known(),
             litepet: Some(rules()),
-            resident: false,
         })
         .expect("应能构造会话")
     }
@@ -669,10 +612,6 @@ mod tests {
         }
     }
 
-    fn assert_alive(outcome: &Outcome) {
-        assert!(!matches!(outcome, Outcome::Exit), "不应退出");
-    }
-
     /// 纯 Codex 包的会话（没有 `litepet` 键）。
     ///
     /// 它和带规则表的包有一个关键差异：反馈动画走 §4.4 的**逐状态**降级映射
@@ -690,7 +629,6 @@ mod tests {
             pet_id: "xunjian-miao".to_string(),
             known,
             litepet: None,
-            resident: false,
         })
         .expect("应能构造会话")
     }
@@ -1023,25 +961,9 @@ mod tests {
         assert_eq!(session.host_count(), 1, "持续心跳的宿主不该被回收");
     }
 
+    /// 常驻：宿主全部断开后 daemon 继续活着（这里就是之前 linger 30 秒退出的位置）。
     #[test]
-    fn bye_starts_linger_and_exits() {
-        let now = Instant::now();
-        let mut session = session();
-        send(&mut session, protocol::method::HOST_HELLO, hello("pi"), now);
-        assert_alive(&send(
-            &mut session,
-            protocol::method::HOST_BYE,
-            json!({ "host": "pi" }),
-            now,
-        ));
-        assert_eq!(session.host_count(), 0);
-        assert_alive(&session.tick(now + LINGER - Duration::from_millis(1)));
-        assert!(matches!(session.tick(now + LINGER), Outcome::Exit));
-    }
-
-    /// 退出是终态：主循环还要跑几拍才能真结束进程，不能把「该退出了」反复上报。
-    #[test]
-    fn exit_is_reported_only_once() {
+    fn daemon_outlives_all_hosts() {
         let now = Instant::now();
         let mut session = session();
         send(&mut session, protocol::method::HOST_HELLO, hello("pi"), now);
@@ -1051,70 +973,27 @@ mod tests {
             json!({ "host": "pi" }),
             now,
         );
+        assert_eq!(session.host_count(), 0);
 
-        assert!(matches!(session.tick(now + LINGER), Outcome::Exit));
-        for round in 1..=3 {
-            let later = now + LINGER + Duration::from_secs(60 * round);
-            assert!(
-                matches!(session.tick(later), Outcome::Unchanged),
-                "第 {round} 次重复空转不该再上报退出"
-            );
-        }
+        // 空转再久（远超旧 linger 的 30 秒）也照样收宿主。
+        // 这里 tick 可能因为 `idleTimeoutMs` 返回 `Display`——那只是换动作，跟退出无关。
+        let later = now + Duration::from_secs(86_400);
+        session.tick(later);
+        send(&mut session, protocol::method::HOST_HELLO, hello("dsh"), later);
+        assert_eq!(session.host_count(), 1);
     }
 
+    /// 宿主崩溃（不发 `host/bye`）：靠心跳超时回收。
     #[test]
-    fn resident_mode_never_lingers_out() {
-        let now = Instant::now();
-        let mut session = Session::new(Setup {
-            pet_id: "xunjian-miao".to_string(),
-            known: known(),
-            litepet: Some(rules()),
-            resident: true,
-        })
-        .expect("应能构造");
-        send(&mut session, protocol::method::HOST_HELLO, hello("pi"), now);
-        assert_alive(&send(
-            &mut session,
-            protocol::method::HOST_BYE,
-            json!({ "host": "pi" }),
-            now,
-        ));
-        assert_alive(&session.tick(now + LINGER * 10));
-    }
-
-    #[test]
-    fn reconnect_during_linger_cancels_exit() {
-        let now = Instant::now();
-        let mut session = session();
-        send(&mut session, protocol::method::HOST_HELLO, hello("pi"), now);
-        assert_alive(&send(
-            &mut session,
-            protocol::method::HOST_BYE,
-            json!({ "host": "pi" }),
-            now,
-        ));
-        // linger 途中重连 → 倒计时取消。
-        assert_alive(&send(
-            &mut session,
-            protocol::method::HOST_HELLO,
-            hello("dsh"),
-            now + Duration::from_secs(20),
-        ));
-        assert_alive(&session.tick(now + Duration::from_secs(45)));
-    }
-
-    /// 宿主崩溃（不发 `host/bye`）：靠心跳超时回收，再走 linger 退出。
-    #[test]
-    fn silent_host_is_reaped_then_daemon_lingers_out() {
+    fn silent_host_is_reaped() {
         let now = Instant::now();
         let mut session = session();
         send(&mut session, protocol::method::HOST_HELLO, hello("pi"), now);
         assert_eq!(session.host_count(), 1);
 
         let silent = now + HOST_TIMEOUT + Duration::from_secs(1);
-        assert_alive(&session.tick(silent));
+        session.tick(silent);
         assert_eq!(session.host_count(), 0, "静默宿主应被回收");
-        assert!(matches!(session.tick(silent + LINGER), Outcome::Exit));
     }
 
     #[test]
@@ -1136,11 +1015,14 @@ mod tests {
     }
 
     #[test]
-    fn daemon_without_any_host_does_not_exit() {
+    fn daemon_without_any_host_stays_idle() {
         let now = Instant::now();
         let mut session = session();
-        // 从未有宿主连过：不作为「全部断开」处理。
-        assert_alive(&session.tick(now + LINGER * 100));
+        // 从未有宿主连过：空转再久，新宿主随时能连上。
+        let later = now + Duration::from_secs(86_400);
+        session.tick(later);
+        send(&mut session, protocol::method::HOST_HELLO, hello("pi"), later);
+        assert_eq!(session.host_count(), 1);
     }
 
     #[test]
@@ -1164,7 +1046,6 @@ mod tests {
             protocol::PROTOCOL_VERSION
         );
         assert_eq!(answered.result["hostCount"], 1);
-        assert_eq!(answered.result["resident"], false);
     }
 
     #[test]

@@ -54,6 +54,29 @@ function fill(config) {
   // 输错了要能看见，而不是一串圆点。
   el('push-key').value = notify.push.deviceKey;
   el('push-endpoint').value = notify.push.endpoint ?? '';
+
+  const auth = config.auth;
+  el('auth-token').value = auth.token;
+  el('auth-out').textContent = authStateHint(auth);
+}
+
+/**
+ * 鉴权状态的一句话说明。
+ *
+ * 只有 token 一个字段，所以这里只有三种情形：没填（不鉴权）、填了但用不了、填好了。
+ * 规则是 `src/config.rs` 里 `Config::auth_gate` 的镜像——那边才是权威，
+ * 这里再算一遍是因为「宿主一定连不上」和「接口对本机全开」这两种状态
+ * 必须在**改完当场**就能看见，而不是等重启之后去翻日志。改规则时两处一起改。
+ */
+function authStateHint(auth) {
+  if (auth.token === '') {
+    return '留空 = 不鉴权：接口只绑回环，但本机上任何程序（包括浏览器里的网页）都能连。';
+  }
+  // 可见 ASCII 且不含空白，与 Rust 侧的 `is_ascii_graphic` 同义。
+  if (!/^[\x21-\x7e]+$/.test(auth.token)) {
+    return '这个 token 用不了（不能有空格或非 ASCII 字符）：保存并重启后所有 HTTP 请求都会被拒绝，宿主连不上。';
+  }
+  return '已启用：请求必须带 Authorization: Bearer <token>。改动需重启 litepet 后生效。';
 }
 
 /**
@@ -82,6 +105,11 @@ function collect() {
         endpoint: el('push-endpoint').value.trim() || null,
       },
     },
+    // token 去掉两头空白：带上空白会让它配不上任何请求（Rust 侧把这种值算不可用）。
+    // 清空它就是「不鉴权」——不需要另外的开关。
+    auth: {
+      token: el('auth-token').value.trim(),
+    },
   };
 }
 
@@ -102,9 +130,11 @@ async function save() {
   }
 }
 
-/** 总开关关掉时，下面的细分项灰掉——不然会让人以为它们还在起作用。 */
+/**
+ * 按总开关把从属项灰掉——不然会让人以为它们还在起作用。
+ */
 function applyEnabled() {
-  const on = el('notify-enabled').checked;
+  const notifyOn = el('notify-enabled').checked;
   for (const id of [
     'sound-enabled',
     'sound-volume',
@@ -114,7 +144,7 @@ function applyEnabled() {
     'push-endpoint',
     'test',
   ]) {
-    el(id).disabled = !on;
+    el(id).disabled = !notifyOn;
   }
 }
 
@@ -256,7 +286,7 @@ async function boot() {
   currentPet = null;
   await refreshPets();
   renderPaths(info);
-  el('meta').textContent = `v${info.version} · 端口改动需重启，其余当场生效`;
+  el('meta').textContent = `v${info.version} · 端口与鉴权改动需重启，其余当场生效`;
 
   // 滑块拖动时先更新数字，松手（`change`）才写盘，免得拖动过程中刷出一串写入。
   el('size').addEventListener('input', () => {
@@ -281,7 +311,7 @@ async function boot() {
     });
   }
   // 文本框在失焦或回车时才写盘。
-  for (const id of ['push-key', 'push-endpoint']) {
+  for (const id of ['push-key', 'push-endpoint', 'auth-token']) {
     el(id).addEventListener('change', save);
   }
   el('test').addEventListener('click', testAlert);

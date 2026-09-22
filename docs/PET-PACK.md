@@ -139,7 +139,7 @@ Rust 侧 `collect_asset_paths` 分三支校验，错误串可直接复用：`"pe
 
 ```
 ~/.litepet/
-├── config.json          ← daemon 配置（窗口位置/大小、置顶、当前宠物…）
+├── config.json          ← daemon 配置（窗口位置/大小、置顶、当前宠物、鉴权…）
 └── pets/
     └── <id>/
         ├── pet.json
@@ -155,6 +155,8 @@ Rust 侧 `collect_asset_paths` 分三支校验，错误串可直接复用：`"pe
 | 是否扫描 `~/.codex/pets/` | **否**（用户明确要求，禁止） |
 
 **空目录是预期状态，不是风险**：本项目是全新项目，`~/.litepet/` 由 daemon 首次启动时 `mkdir -p` 创建并写入默认 `config.json`。
+
+> `config.json` 的 `auth` 段（只有一个 `token` 字段）见 `docs/PROTOCOL.md` §1：**token 由用户自己定，daemon 不生成也不轮换；填了就要鉴权，留空就不鉴权**。
 
 环境变量只设**一个** `LITEPET_HOME` 覆盖整个家目录，而不是用 `LITEPET_PETS_DIR` 单独覆盖宠物目录。理由：**Codex 本身就是 `CODEX_HOME` 这个形状**（`{CODEX_HOME}/pets/<id>/pet.json`），沿用同一模式降低认知成本，也避开「配置在 A、宠物在 B」的割裂。
 

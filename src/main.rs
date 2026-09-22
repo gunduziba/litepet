@@ -27,6 +27,7 @@ mod http;
 mod jsonrpc;
 mod logging;
 mod pack;
+mod presence;
 mod protocol;
 mod session;
 
@@ -46,6 +47,7 @@ use alert::sound::RodioSpeaker;
 use alert::{AlertSpec, Alerter, Channels, Request};
 use config::NotifyConfig;
 use jsonrpc::ErrorObject;
+use presence::Presence;
 
 /// 窗口标签：宠物主窗口（与 `tauri.conf.json` 里那条一致）。
 const MAIN_WINDOW: &str = "pet";
@@ -117,6 +119,79 @@ fn renderer_applied(animation: String, bubble: Option<String>) {
     }
 }
 
+/// App 包里自带宠物的资源目录名。
+///
+/// `tauri.conf.json` 的 `bundle.resources` 把仓库的 `assets/pets` 铺到它的
+/// `Contents/Resources/pets`，所以这里只写叶子名。资源是**散文件**而不是嵌进
+/// 二进制：图集只有换包时才变，没必要每次升级都重新分发一份（`docs/PET-PACK.md` §7.3）。
+const BUNDLED_PETS: &str = "pets";
+
+/// 首次初始化家目录时，把 App 自带的宠物铺进 `~/.litepet/pets/`。
+///
+/// 只在**初始化**这一次做：用户把包删掉就是不想再看见它，每次启动都补回来会很烦。
+/// 同理也**不覆盖**已有文件——用户可能换过图、改过名字，升级安装不该把他的改动冲掉。
+fn seed_default_pets(app: &tauri::AppHandle) {
+    let source = match app.path().resource_dir() {
+        Ok(dir) => dir.join(BUNDLED_PETS),
+        Err(err) => {
+            log::warn!("取不到资源目录，自带的宠物不会被铺出来：{err}");
+            return;
+        }
+    };
+    let Ok(destination) = config::pets_dir() else {
+        log::warn!("取不到宠物目录，自带的宠物不会被铺出来");
+        return;
+    };
+    if !source.is_dir() {
+        // 开发时直接 `cargo run`（没经打包流程）就会走到这里，不是错误。
+        log::warn!("App 里没有自带宠物（{}），跳过", source.display());
+        return;
+    }
+    match copy_missing_pack_files(&source, &destination) {
+        Ok(0) => log::info!("自带宠物都已在位，未做改动"),
+        Ok(count) => log::info!("已铺出 {count} 个自带宠物文件到 {}", destination.display()),
+        Err(err) => log::warn!("铺出自带宠物失败：{err:#}"),
+    }
+}
+
+/// 把 `source` 下的宠物包逐个补到 `destination`，只补**不存在**的文件，返回补了几个。
+///
+/// 跳过点开头的文件：`pets/` 里最常见的垃圾是 macOS 自动生成的 `.DS_Store`，
+/// 它跟宠物包毫无关系，不该跟着资源进用户目录。
+fn copy_missing_pack_files(source: &Path, destination: &Path) -> Result<usize> {
+    let mut copied = 0;
+    let packs = std::fs::read_dir(source)
+        .with_context(|| format!("读自带宠物目录失败：{}", source.display()))?;
+    for pack in packs.flatten() {
+        if !pack.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let target_pack = destination.join(pack.file_name());
+        let entries = std::fs::read_dir(pack.path())
+            .with_context(|| format!("读自带宠物包失败：{}", pack.path().display()))?;
+        for entry in entries.flatten() {
+            let is_dotfile = entry.file_name().to_string_lossy().starts_with('.');
+            let is_file = entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false);
+            if is_dotfile || !is_file {
+                continue;
+            }
+            let target = target_pack.join(entry.file_name());
+            if target.exists() {
+                continue;
+            }
+            std::fs::create_dir_all(&target_pack)
+                .with_context(|| format!("创建宠物包目录失败：{}", target_pack.display()))?;
+            std::fs::copy(entry.path(), &target)
+                .with_context(|| format!("复制 {} 失败", entry.path().display()))?;
+            copied += 1;
+        }
+    }
+    Ok(copied)
+}
+
 /// 选中要加载的包 id：优先配置指定，否则取 `pets/` 下第一个可用包。
 fn pick_pack(root: &Path, preferred: Option<&str>) -> Option<String> {
     if let Some(id) = preferred {
@@ -136,10 +211,12 @@ fn pick_pack(root: &Path, preferred: Option<&str>) -> Option<String> {
 }
 
 /// 读取配置并加载宠物包，顺带把本次启动要用的端口带出来。
-fn try_init_pet() -> Result<(pack::LoadedPet, u16)> {
+fn try_init_pet(app: &tauri::AppHandle) -> Result<(pack::LoadedPet, u16)> {
     let (cfg, created) = config::load_or_init()?;
     if created {
         log::info!("已初始化家目录 {}", config::home_dir()?.display());
+        // 必须在 `pick_pack` 之前：首次启动时 `pets/` 是空的，先铺才有得挑。
+        seed_default_pets(app);
     }
     let root = config::pets_dir()?;
     let id = pick_pack(&root, cfg.pet.as_deref())
@@ -171,8 +248,8 @@ fn try_init_pet() -> Result<(pack::LoadedPet, u16)> {
 ///
 /// 返回的端口在加载失败时没有意义（此时也不会有 HTTP 服务），
 /// 用默认值填上只是让调用方不必处理 `Option`。
-fn init_pet() -> (PetState, u16) {
-    match try_init_pet() {
+fn init_pet(app: &tauri::AppHandle) -> (PetState, u16) {
+    match try_init_pet(app) {
         Ok((loaded, port)) => (PetState(Arc::new(Mutex::new(Some(Arc::new(loaded))))), port),
         Err(err) => {
             log::error!("宠物包加载失败：{err:#}");
@@ -185,7 +262,7 @@ fn init_pet() -> (PetState, u16) {
 ///
 /// 行为配置非法、生成 token 失败、写对接信息失败都只告警：宠物仍应作为
 /// 「没人说话的桌宠」正常显示。**但端口抢占失败是例外**——那是单例约束，直接退出。
-fn start_http(app: tauri::AppHandle, state: &PetState, port: u16, resident: bool) {
+fn start_http(app: tauri::AppHandle, state: &PetState, port: u16) {
     let loaded = state
         .0
         .lock()
@@ -199,7 +276,6 @@ fn start_http(app: tauri::AppHandle, state: &PetState, port: u16, resident: bool
         pet_id: loaded.info.id.clone(),
         known: loaded.info.animations.keys().cloned().collect(),
         litepet: loaded.behavior.clone(),
-        resident,
     };
     let session = match session::Session::new(setup) {
         Ok(session) => session,
@@ -228,14 +304,20 @@ fn start_http(app: tauri::AppHandle, state: &PetState, port: u16, resident: bool
             std::process::exit(1);
         }
     };
-    let token = match config::random_token() {
-        Ok(token) => token,
+    // 鉴权开关与 token 都取自配置：token 是用户自己定的，不再每次启动重新生成，
+    // 于是宿主配好一次就不用再回去重读。状态已由 `main` 报过日志。
+    let (cfg, _) = match config::load_or_init() {
+        Ok(cfg) => cfg,
         Err(err) => {
             log::error!("{err:#}");
             return;
         }
     };
-    match config::write_endpoint(protocol::PROTOCOL_VERSION, port, &token) {
+    // 端点文件里始终写配置里那个值（关掉鉴权时可能是空串），
+    // 使宿主读到的内容在多次启动之间保持不变。
+    let endpoint_token = cfg.auth.token.clone();
+    let gate = cfg.auth_gate();
+    match config::write_endpoint(protocol::PROTOCOL_VERSION, port, &endpoint_token) {
         Ok(path) => log::info!(
             "监听 http://127.0.0.1:{port}{}（对接信息 {}）",
             http::RPC_PATH,
@@ -256,14 +338,14 @@ fn start_http(app: tauri::AppHandle, state: &PetState, port: u16, resident: bool
         pet: Arc::clone(&state.0),
         sessions: Arc::clone(&sessions),
         alerts: Arc::clone(&alerts),
-        resident,
     });
     app.manage(DaemonHandle(Arc::clone(&daemon)));
-    build_tray(&app, Arc::clone(&alerts), port);
+    let presence = Arc::new(Presence::default());
+    build_tray(&app, Arc::clone(&alerts), port, Arc::clone(&presence));
 
-    // 两个钩子各要一个自己的 `AppHandle`。
+    // 两个钩子各要一个自己的 `AppHandle`（闭包只能各持一个）。
     let display_app = app.clone();
-    let exit_app = app;
+    let presence_app = app;
     let alert_slot = Arc::clone(&alerts);
     let hooks = Arc::new(http::Hooks {
         display: Box::new(move |directive| {
@@ -271,13 +353,8 @@ fn start_http(app: tauri::AppHandle, state: &PetState, port: u16, resident: bool
                 log::error!("推送渲染层失败：{err}");
             }
         }),
-        exit: Box::new(move || {
-            // 正常退出时收拾对接信息；失败只提示，不影响退出。
-            if let Err(err) = config::remove_endpoint() {
-                log::error!("{err:#}");
-            }
-            exit_app.exit(0);
-        }),
+        // 没人连了就收进托盘，宿主连回来再露出来；判断都在 `apply_presence` 里。
+        hosts: Box::new(move |count| apply_presence(&presence_app, &presence, count)),
         // 读槽而不是抱死一个 `Alerter`：设置页改完提醒配置会换一份进去，
         // 下一次提醒就该用新的——否则用户填完 token 还得重启才能试。
         alert: Box::new(move |request| match alert_slot.lock() {
@@ -288,7 +365,7 @@ fn start_http(app: tauri::AppHandle, state: &PetState, port: u16, resident: bool
 
     let shared = Arc::new(http::Shared {
         sessions,
-        token,
+        gate,
         hooks,
         daemon: Arc::clone(&daemon) as Arc<dyn http::Daemon>,
     });
@@ -316,8 +393,6 @@ struct DaemonState {
     sessions: Arc<Mutex<session::Session>>,
     /// 提醒执行端。
     alerts: AlertSlot,
-    /// 启动参数带来的常驻模式；换包时要原样带过去。
-    resident: bool,
 }
 
 impl DaemonState {
@@ -470,7 +545,6 @@ impl http::Daemon for DaemonState {
             pet_id: loaded.info.id.clone(),
             known: loaded.info.animations.keys().cloned().collect(),
             litepet: loaded.behavior.clone(),
-            resident: self.resident,
         };
         {
             let mut sessions = self
@@ -590,6 +664,11 @@ fn restart_required(before: &config::Config, after: &config::Config) -> Vec<&'st
     if before.port != after.port {
         fields.push("port");
     }
+    // 鉴权也是启动时定下的：`Shared.gate` 在 `serve` 时就交出去了，
+    // 改完得重启才生效，不能假装已经生效——否则用户会以为立刻就不需要 token 了。
+    if before.auth.token != after.auth.token {
+        fields.push("auth");
+    }
     fields
 }
 
@@ -597,7 +676,7 @@ fn restart_required(before: &config::Config, after: &config::Config) -> Vec<&'st
 ///
 /// 无边框窗口没有标题栏与菜单，托盘的「显示宠物」是**唯一**能把藏起来的宠物
 /// 找回来的入口。即便如此，图标没配好也不该让整个启动失败——只告警。
-fn build_tray(app: &tauri::AppHandle, alerts: AlertSlot, port: u16) {
+fn build_tray(app: &tauri::AppHandle, alerts: AlertSlot, port: u16, presence: Arc<Presence>) {
     let built = (|| -> Result<()> {
         let show = MenuItem::with_id(app, "show", "显示宠物", true, None::<&str>)?;
         let hide = MenuItem::with_id(app, "hide", "隐藏宠物", true, None::<&str>)?;
@@ -624,8 +703,8 @@ fn build_tray(app: &tauri::AppHandle, alerts: AlertSlot, port: u16) {
             .tooltip(format!("LitePet · 端口 {port}"))
             .menu(&menu)
             .on_menu_event(move |app, event| match event.id().as_ref() {
-                "show" => set_pet_visible(app, true),
-                "hide" => set_pet_visible(app, false),
+                "show" => show_pet_manually(app, &presence),
+                "hide" => hide_pet_manually(app, &presence),
                 "settings" => open_config_window(app),
                 "test" => fire_test_alert(&alerts),
                 "pets" => reveal_pets_dir(),
@@ -643,6 +722,35 @@ fn build_tray(app: &tauri::AppHandle, alerts: AlertSlot, port: u16) {
     if let Err(err) = built {
         log::warn!("托盘不可用（宠物仍会显示）：{err:#}");
     }
+}
+
+/// 宿主数变化时的自动显隐（写在 `Hooks::hosts` 里，跑在 HTTP 工作线程上）。
+///
+/// 决策在 [`Presence::report`] 里，这里只管把结果落到窗口上。
+fn apply_presence(app: &tauri::AppHandle, presence: &Presence, hosts: usize) {
+    match presence.report(hosts) {
+        Some(false) => {
+            log::info!("宿主全部断开，宠物收进托盘");
+            set_pet_visible(app, false);
+        }
+        Some(true) => {
+            log::info!("有宿主接入，宠物显示出来");
+            set_pet_visible(app, true);
+        }
+        None => {}
+    }
+}
+
+/// 托盘「显示宠物」：清掉手动状态，控制权交回自动。
+fn show_pet_manually(app: &tauri::AppHandle, presence: &Presence) {
+    presence.show_manually();
+    set_pet_visible(app, true);
+}
+
+/// 托盘「隐藏宠物」：这是「我说了算」，自动逻辑从此不再碰窗口。
+fn hide_pet_manually(app: &tauri::AppHandle, presence: &Presence) {
+    presence.hide_manually();
+    set_pet_visible(app, false);
 }
 
 /// 显示/隐藏主窗口。
@@ -761,17 +869,20 @@ fn build_alerter(app: tauri::AppHandle, pack_root: PathBuf) -> Arc<Alerter> {
     ))
 }
 
-/// 解析命令行：`--resident` 与 `--port`。
-fn parse_args() -> (bool, Option<u16>) {
-    let mut resident = false;
+/// 解析命令行：`--port`。
+///
+/// `--resident` 还收，但已经什么都不做——宠物本来就是常驻的（`docs/PROTOCOL.md` §8）。
+/// 留着它是因为老的自启动项里还写着这个参数，报「未知参数」会打断启动。
+fn parse_args() -> Option<u16> {
     let mut port = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--resident" => resident = true,
+            // 过渡期兼容：不再有「非驻留」这种模式。
+            "--resident" => {}
             "--port" => port = args.next().and_then(|raw| raw.parse().ok()),
             "--help" | "-h" => {
-                println!("litepet [--resident] [--port <端口>]");
+                println!("litepet [--port <端口>]");
                 std::process::exit(0);
             }
             other => {
@@ -780,11 +891,11 @@ fn parse_args() -> (bool, Option<u16>) {
             }
         }
     }
-    (resident, port)
+    port
 }
 
 fn main() {
-    let (resident, port) = parse_args();
+    let port = parse_args();
     // 日志尽早装上：后面的启动诊断都要落盘。双击启动的 GUI 没有终端，stderr 等于丢。
     if let Err(err) = logging::init() {
         eprintln!("litepet: 日志初始化失败，本次只输出到 stderr：{err:#}");
@@ -797,11 +908,23 @@ fn main() {
         ),
         Err(_) => log::info!("v{} 启动", env!("CARGO_PKG_VERSION")),
     }
-    if resident {
-        log::info!("常驻模式，全部宿主断开后不退出");
+    // 鉴权状态在启动时就报出来：它要么意味着接口对本机全开，要么意味着宿主一定连不上，
+    // 两种都得让人知道。**不在这里拦启动**——鉴权只管 `POST /rpc` 的准入，
+    // 跟窗口、托盘、宠物渲染无关（理由见 `config::AuthGate::Locked`）。
+    match config::load_or_init().map(|(cfg, _)| cfg.auth_gate()) {
+        Ok(config::AuthGate::Token(_)) => {
+            log::info!("鉴权已启用，token 取自 config.json 的 auth.token");
+        }
+        Ok(config::AuthGate::Open) => log::warn!(
+            "未设置 token（config.json 的 auth.token 为空）：接口不做鉴权，本机上任何程序都能连"
+        ),
+        Ok(config::AuthGate::Locked) => log::error!(
+            "config.json 里的 auth.token 含空白或非 ASCII 字符，这个值永远配不上：所有 HTTP 请求都会被拒绝，宿主连不上。请到设置页或 config.json 改成可见 ASCII 口令，或清空它表示不鉴权"
+        ),
+        Err(err) => log::warn!("读配置失败，暂时无法确定鉴权状态：{err:#}"),
     }
-    // 监听端口在 `setup` 里才定下来（要读配置），但退出回调在主线程上跑，
-    // 两者之间只能靠一个共享值传递。
+    // 监听端口在 `setup` 里才定下来（要读配置），但退出清理在主线程的
+    // `RunEvent::Exit` 上跑，两者之间只能靠一个共享值传递。
     let bound_port = Arc::new(AtomicU16::new(0));
     let port_shared = Arc::clone(&bound_port);
     let app = tauri::Builder::default()
@@ -811,13 +934,17 @@ fn main() {
         // 整个进程带走，表现就是「程序直接退出」。
         .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
-            let (state, configured_port) = init_pet();
+            // 桌宠不需要 Dock 图标，也不需要在 Cmd+Tab 里露脸：托盘就是它的入口。
+            // Accessory 正好去掉这两样。
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            let (state, configured_port) = init_pet(app.handle());
             // 命令行优先于配置文件。
             let port = port.unwrap_or(configured_port);
             // 留给退出清理：它得知道对接文件里那个端口是不是自己写的。
             port_shared.store(port, Ordering::Relaxed);
             // `start_http` 内部会 `manage` 那个共享句柄，所以得先拿到 `&state`。
-            start_http(app.handle().clone(), &state, port, resident);
+            start_http(app.handle().clone(), &state, port);
             app.manage(state);
             // 尺寸、置顶与位置都以 config.json 为准，tauri.conf.json 里那份只是兜底。
             apply_startup_window(app.handle());

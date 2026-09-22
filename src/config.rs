@@ -2,9 +2,8 @@
 //!
 //! 家目录约定见 `docs/PET-PACK.md` §2：`~/.litepet/` 同时装配置与 `pets/`。
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -27,8 +26,6 @@ const LOGS_DIR: &str = "logs";
 const ENDPOINT_FILE: &str = "daemon.json";
 /// 默认 HTTP 端口。
 pub const DEFAULT_PORT: u16 = 4590;
-/// 生成 token 的字节数（128 位）。
-const TOKEN_BYTES: usize = 16;
 /// 含密钥文件的权限位。
 const PRIVATE_MODE: u32 = 0o600;
 /// 默认窗口边长（像素）。
@@ -67,6 +64,9 @@ pub struct Config {
     /// 通知（声音／系统通知／手机推送）。
     #[serde(default)]
     pub notify: NotifyConfig,
+    /// 鉴权（`POST /rpc` 的 token 校验）。
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 impl Default for Config {
@@ -79,6 +79,7 @@ impl Default for Config {
             always_on_top: true,
             port: DEFAULT_PORT,
             notify: NotifyConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 }
@@ -116,6 +117,26 @@ impl Config {
             self.port = DEFAULT_PORT;
         }
     }
+
+    /// 解析本次启动的准入策略。
+    ///
+    /// **有 token 就按 token 校验，token 为空就不鉴权**——只有这两条分支，
+    /// 因为它们靠同一个字段就能区分开，不需要额外的开关（见 [`AuthConfig`]）。
+    ///
+    /// token 配得不对只锁接口，**不阻止启动**：理由见 [`AuthGate::Locked`]。
+    pub fn auth_gate(&self) -> AuthGate {
+        if self.auth.token.is_empty() {
+            return AuthGate::Open;
+        }
+        // 判在 `auth.token` 原值上，而不是 trim 后的值上：两头的空白会让它永远配不上
+        // 任何请求（校验时两边的空白都会被 `trim` 掉），所以直接算不可用。
+        // 非可见 ASCII 同样不可用：那种头值会在 HTTP 解析层就把连接掐断，
+        // 请求连 401 都拿不到（实测 curl 退出码 52），永远不可能匹配成功。
+        if self.auth.token.chars().all(|c| c.is_ascii_graphic()) {
+            return AuthGate::Token(self.auth.token.clone());
+        }
+        AuthGate::Locked
+    }
 }
 
 /// `serde` 缺省值：窗口边长。
@@ -131,6 +152,45 @@ fn default_port() -> u16 {
 /// `serde` 缺省值：置顶开关。
 fn default_true() -> bool {
     true
+}
+
+/// `POST /rpc` 的准入策略，由 `config.json` 的 `auth` 段解析而来（见 [`Config::auth_gate`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthGate {
+    /// 配置里**没有** token：不要求任何头。
+    ///
+    /// 接口仍然只绑回环，但**同机上任何程序都能连**，包括你正在浏览的网页
+    /// （浏览器向 `localhost` 发简单请求可以绕过 CORS 预检）。
+    Open,
+    /// 配了 token，但那个 token 根本用不了：**一个请求都不放进来**。
+    ///
+    /// 既不是「拒绝启动」，也不是「退回不鉴权」。
+    /// 不拒绝启动：鉴权只管 `POST /rpc` 的准入，跟窗口、托盘、宠物渲染无关，
+    /// 不该因为一个填错的 token 让人连宠物都看不见。
+    /// 不退回不鉴权：那是静悄悄地把接口敲开，而用户会以为自己已经设了防，
+    /// 比大声报错难发现得多。空 token 走的是 [`AuthGate::Open`]，这里不含这一种。
+    Locked,
+    /// 校验 `Authorization: Bearer <token>`。
+    Token(String),
+}
+
+/// 鉴权配置：`config.json` 的 `auth` 段。
+///
+/// **只有 token 一个字段。** 早先还有一个 `enabled` 开关，删掉了：
+/// 「要不要鉴权」看 token 空不空就已经能表达，多一个开关就多出一种自相矛盾的摆法
+/// （开着鉴权却没填 token），还得额外规定那种摆法算哪边。
+///
+/// **token 由用户自己定，daemon 不生成、不轮换。** 更早的版本每次启动随机生成一个，
+/// 那等于要求宿主每次重启都回去重读端点文件；用户配好的值重启一次就没了。
+///
+/// `Default` 是 derive 出来的，即**缺省 token 为空 = 缺省不鉴权**。这是有意定的缺省方向，
+/// 不是遗漏：旧配置里没有 `auth` 段时也走这条路，所以「不设防」会在启动日志里
+/// `warn` 出来，让人知道它现在是这个状态。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AuthConfig {
+    /// 访问密钥，用户自定。**留空 = 不鉴权**；含空白或非 ASCII 字符时接口会被锁死（见 [`Config::auth_gate`]）。
+    pub token: String,
 }
 
 /// 通知配置：`config.json` 的 `notify` 段（全部字段可缺省）。
@@ -249,8 +309,9 @@ pub fn config_path() -> Result<PathBuf> {
 /// 宿主只要读这个文件就知道该往哪个端口、带哪个 token 发 JSON-RPC，
 /// 因此端口改到非默认值也不会让宿主迷失。
 ///
-/// token 每次启动重新生成，所以这是运行期状态：异常退出可能残留，
-/// 那时里面的端口已经没人监听，宿主连不上自然会重新拉起 daemon。
+/// token 来自 `config.json` 的 `auth.token`（用户自定，不随启动变化）；
+/// 关掉鉴权时它是空串。这个文件本身仍是运行期状态：正常退出时删除，
+/// 异常退出可能残留——那时里面的端口已经没人监听，宿主连不上自然会重新拉起 daemon。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Endpoint {
@@ -258,7 +319,7 @@ pub struct Endpoint {
     pub protocol_version: u32,
     /// HTTP 端口。
     pub port: u16,
-    /// 访问密钥（32 位十六进制）。
+    /// 访问密钥；关掉鉴权时为空串。
     pub token: String,
 }
 
@@ -314,21 +375,6 @@ pub fn remove_endpoint_for(port: u16) -> Result<()> {
 /// 删错了会让另一个还在跑的实例从磁盘上消失，留着最多多覆盖一次。
 fn endpoint_belongs_to(body: &str, port: u16) -> bool {
     serde_json::from_str::<Endpoint>(body).is_ok_and(|endpoint| endpoint.port == port)
-}
-
-/// 生成一个 128 位随机 token（32 位小写十六进制）。
-///
-/// 复用依赖树里已有的 `getrandom`，不自造随机数。
-pub fn random_token() -> Result<String> {
-    let mut bytes = [0u8; TOKEN_BYTES];
-    // `getrandom::Error` 没有实现 `std::error::Error`，只能手接错误。
-    getrandom::fill(&mut bytes).map_err(|err| anyhow!("获取系统随机数失败：{err}"))?;
-    let mut token = String::with_capacity(TOKEN_BYTES * 2);
-    for byte in bytes {
-        // 往 `String` 里写不可能失败。
-        write!(token, "{byte:02x}").expect("写入 String 不会失败");
-    }
-    Ok(token)
 }
 
 /// 在 `path` 旁边造一个 `<文件名><后缀>` 的兄弟路径。
@@ -546,13 +592,66 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// **没填 token 就是不鉴权**，不看任何头。
     #[test]
-    fn random_token_is_hex_and_unique() {
-        let first = random_token().expect("应能生成 token");
-        let second = random_token().expect("应能生成 token");
-        assert_eq!(first.len(), 32);
-        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(first, second, "两次生成不应撞车");
+    fn empty_token_means_no_auth() {
+        let cfg = Config {
+            auth: AuthConfig {
+                token: String::new(),
+            },
+            ..Config::default()
+        };
+        assert_eq!(cfg.auth_gate(), AuthGate::Open);
+    }
+
+    /// 非 ASCII 或带空白的 token 一律算不可用：**锁接口，但不拦启动**。
+    ///
+    /// 前一组行钉住一个实测到的现象：把中文字写进 `Authorization` 头，
+    /// tiny_http 会直接掐掉连接，客户端拿到的是「空响应」而不是 401——
+    /// 那时人会去查端口、查网络，唯独不会想到是 token 里那个字。
+    /// 纯空白也在这一组：它不是「没填」，是填了个配不上的东西。
+    ///
+    /// 后一半行钉住一个真实争论：先前这里写的是「直接 `exit(1)`」。那不对——
+    /// 鉴权只管 `POST /rpc` 的准入，跟窗口、托盘、宠物渲染无关，
+    /// 一个填错的 token 不该让人连宠物都看不见。
+    #[test]
+    fn unusable_token_locks_the_gate_instead_of_blocking_startup() {
+        for token in ["我自己的口令", " has-space", "has space", "tab\there", "   "] {
+            let cfg = Config {
+                auth: AuthConfig {
+                    token: token.to_string(),
+                },
+                ..Config::default()
+            };
+            assert_eq!(cfg.auth_gate(), AuthGate::Locked, "token={token:?}");
+        }
+    }
+
+    /// 用户填了可用的 token 就照它校验。
+    #[test]
+    fn configured_token_resolves_to_that_token() {
+        let cfg = Config {
+            auth: AuthConfig {
+                token: "my-own-secret-abc123".to_string(),
+            },
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.auth_gate(),
+            AuthGate::Token("my-own-secret-abc123".to_string())
+        );
+    }
+
+    /// 旧配置文件里没有 `auth` 段 → token 为空 → **不鉴权**。
+    ///
+    /// 这是用户明确要的语义（「token 为空则默认不用鉴权」），不是漏配的意外：
+    /// 缺省值就是空 token，升级上来的老配置也一样。代价是**不设防时不拦人**，
+    /// 所以那个状态会在启动日志里 `warn` 出来，设置页也当场写着「本机谁都能连」。
+    #[test]
+    fn legacy_config_without_auth_means_no_auth() {
+        let cfg: Config = serde_json::from_str("{}").expect("空配置应能解析");
+        assert_eq!(cfg.auth.token, "", "缺省的 token 应当是空串");
+        assert_eq!(cfg.auth_gate(), AuthGate::Open);
     }
 
     #[test]

@@ -166,11 +166,6 @@ impl Arbiter {
         self.hosts.len()
     }
 
-    /// 是否没有任何宿主。
-    pub fn is_empty(&self) -> bool {
-        self.hosts.is_empty()
-    }
-
     /// `agent.start`：进入 working（状态变迁会清掉旧的显式 `play`）。
     pub fn on_agent_start(&mut self, host: &str, now: Instant) {
         if let Some(entry) = self.hosts.get_mut(host) {
@@ -323,8 +318,8 @@ impl Arbiter {
 
     /// 注销超时未联系的宿主，返回被注销的宿主名。
     ///
-    /// HTTP 是无连接的：宿主崩掉时不会有机会发 `host/bye`，而「宿主还在」是
-    /// linger 倒计时的前提。没有这个兜底，宠物会永远赖在屏幕上不退出
+    /// HTTP 是无连接的：宿主崩掉时不会有机会发 `host/bye`，没有这个兜底，
+    /// 挂掉的宿主会一直被算作「还在连」，宠物也就不会收进托盘
     /// （`docs/PROTOCOL.md` §7）。未登记的宿主不受影响。
     pub fn reap_dead(&mut self, now: Instant, timeout: Duration) -> Vec<String> {
         let dead: Vec<String> = self
@@ -891,7 +886,7 @@ mod tests {
         let mut arbiter = arbiter_with("pi", now);
         assert_eq!(arbiter.host_count(), 1);
         arbiter.unregister("pi");
-        assert!(arbiter.is_empty());
+        assert_eq!(arbiter.host_count(), 0);
         assert!(!arbiter.is_registered("pi"));
     }
 

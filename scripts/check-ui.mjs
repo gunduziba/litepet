@@ -263,9 +263,50 @@ check(
   `测试结果没渲染：${registry.get('test-out').textContent}`,
 );
 
+// 7. 鉴权只剩一个字段 token：要按 camelCase 读回来（config.auth），并进补丁。
+check(
+  registry.get('auth-token').value === 'my-own-secret-abc123',
+  `auth.token 应回填，实际「${registry.get('auth-token').value}」`,
+);
+check(
+  registry.get('auth-out').textContent.includes('已启用'),
+  `配了 token 应报已启用，实际「${registry.get('auth-out').textContent}」`,
+);
+
+// 8. 用不了的 token 必须在**改完当场**就说出来：那是「宿主一定连不上」的状态，
+// 等到重启后去翻日志就已经晚了。规则与 src/config.rs 的 `Config::auth_gate` 对应。
+registry.get('auth-token').value = '带 空格';
+await Promise.all(registry.get('auth-token').fire('change'));
+await settle();
+let authPatch = sent.findLast((call) => call.method === 'config/set')?.params?.auth;
+check(
+  authPatch !== undefined && !('enabled' in authPatch),
+  `补丁不该再有 auth.enabled，实际 ${JSON.stringify(authPatch)}`,
+);
+check(authPatch?.token === '带 空格', `补丁应带 auth.token，实际 ${JSON.stringify(authPatch)}`);
+check(
+  registry.get('auth-out').textContent.includes('用不了'),
+  `用不了的 token 应当场报出来，实际「${registry.get('auth-out').textContent}」`,
+);
+
+// 9. 清空 token = 不鉴权：这是唯一表达「不要鉴权」的摆法（没有额外开关），
+// patch 里就是一个空串——两头的空白先被 trim 掉。
+registry.get('auth-token').value = '   ';
+await Promise.all(registry.get('auth-token').fire('change'));
+await settle();
+authPatch = sent.findLast((call) => call.method === 'config/set')?.params?.auth;
+check(
+  authPatch?.token === '',
+  `清空后补丁里的 token 应是空串，实际 ${JSON.stringify(authPatch)}`,
+);
+check(
+  registry.get('auth-out').textContent.includes('不鉴权'),
+  `清空后应报「不鉴权」，实际「${registry.get('auth-out').textContent}」`,
+);
+
 if (failures.length) {
   console.error(`UI 检查未通过（${failures.length} 项）：`);
   for (const failure of failures) console.error(`  ✗ ${failure}`);
   process.exit(1);
 }
-console.log('UI 检查通过：snake_case lint、CSS 注释与变量、设置页渲染/字段名/补丁范围/测试提醒均正常。');
+console.log('UI 检查通过：snake_case lint、CSS 注释与变量、设置页渲染/字段名/补丁范围/测试提醒/单个 token 的鉴权均正常。');

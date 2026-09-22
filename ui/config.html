@@ -88,6 +88,27 @@
       </section>
 
       <section>
+        <h2>宿主接入</h2>
+        <p class="hint">
+          宿主（pi / dsh）用 <code>http://127.0.0.1:&lt;端口&gt;/rpc</code> 连过来，
+          端口与 token 从 <code>~/.litepet/daemon.json</code> 读。
+          <b>填了 token 就要求请求带 <code>Authorization: Bearer &lt;token&gt;</code>；留空则不鉴权。</b>
+          这一页只管“请求要不要带凭据”，跟窗口、托盘、宠物都不相干——token 填错了也只是宿主连不上。
+        </p>
+        <div class="row">
+          <span class="label">API token</span>
+          <input
+            id="auth-token"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="留空 = 不鉴权"
+          />
+        </div>
+        <p class="hint" id="auth-out">—</p>
+      </section>
+
+      <section>
         <h2>路径</h2>
         <dl id="paths"></dl>
       </section>

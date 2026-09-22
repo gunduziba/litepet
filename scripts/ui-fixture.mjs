@@ -10,6 +10,7 @@
 export const CONFIG_GET = {
   config: {
     alwaysOnTop: true,
+    auth: { token: 'my-own-secret-abc123' },
     notify: {
       desktop: { enabled: true },
       enabled: true,
