@@ -106,6 +106,30 @@ LitePet 的运行时配置与工作目录默认位于 `~/.litepet/`（可通过�
 
 ---
 
+## 🔌 通信协议与事件契约
+
+LitePet 与各类宿主（插件/适配器）之间基于标准的 **HTTP/1.1 + JSON-RPC 2.0** 协议通信，仅监听本机回环地址（127.0.0.1）。
+
+### 核心机制
+- **端点发现**：宿主启动时读取 `~/.litepet/daemon.json` 获取动态端口与鉴权 Token。
+- **单向事件流**：状态事件（如 `agent/start`、`tool/start`、`agent/end` 等）采用异步通知机制（Notification），服务端即时返回 `204 No Content`，不阻塞宿主主执行流程。
+- **多宿主仲裁**：同机多个 Agent 实例接入时，采用最新事件优先（Last-Event-Wins）策略调度动作与气泡，并显示对应宿主标识。
+
+### 核心接口概览
+| 方法名 | 交互类型 | 作用说明 |
+|---|---|---|
+| `host/hello` | 请求 (Request) | 宿主首次接入时必须调用，完成协议版本握手与注册 |
+| `daemon/ping` | 请求 (Request) | 宿主心跳保活（建议每 20 秒一次） |
+| `agent/start` | 通知 (Notification) | Agent 开始执行任务，桌宠切换至工作（打字）动画 |
+| `tool/start` / `tool/end` | 通知 (Notification) | 工具调用起止，桌宠头顶展示实时执行气泡 |
+| `agent/end` | 通知 (Notification) | 单轮会话结束，触发成功（举杠铃）或失败动作反馈 |
+| `agent/settled` | 通知 (Notification) | Agent 任务彻底收工，触发音效、系统通知与手机推送 |
+| `host/bye` | 通知 (Notification) | 宿主退出前主动注销，快速释放状态 |
+
+👉 **关于数据包结构、完整方法参数、状态码与多语言调用示例，请查阅**：[LitePet 通信协议规范 (docs/PROTOCOL.md)](docs/PROTOCOL.md)。
+
+---
+
 ## 🛠️ 调试与测试
 
 仓库内置了模拟宿主会话的脚本，可用于独立验证守护进程：
