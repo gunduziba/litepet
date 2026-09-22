@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "resources": {
+      "assets/win/WebView2Loader.dll": "."
+    }
+  }
+}
