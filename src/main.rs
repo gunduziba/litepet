@@ -27,6 +27,7 @@ mod http;
 mod jsonrpc;
 mod logging;
 mod pack;
+mod placement;
 mod presence;
 mod protocol;
 mod session;
@@ -56,6 +57,8 @@ const MAIN_WINDOW: &str = "pet";
 const CONFIG_WINDOW: &str = "config";
 /// 托盘图标 id。
 const TRAY_ID: &str = "main";
+/// 「回到主屏」与兜底落点离屏幕边缘的留白（逻辑像素）。
+const PET_MARGIN: f64 = 24.0;
 
 /// 渲染层与 session 线程共用的宠物包。
 ///
@@ -492,23 +495,87 @@ fn apply_window_config(app: &tauri::AppHandle, cfg: &config::Config, with_positi
     let (Some(x), Some(y)) = (cfg.x, cfg.y) else {
         return;
     };
-    // 位置：`Moved` 与 `outer_position()` 给的是同一套**物理**坐标，但这条路上有个坑——
-    // `set_position(Physical(_))` 会先按 `window.scale_factor()` 换成逻辑坐标再交给系统，
-    // 而这个读在窗口刚建好时是 1.0（真值 2.0），于是请求物理 300 得到物理 600。
-    // 更糟的是 `Moved` 随后报 600并被写回配置，下次启动再翻一倍：窗口几轮后就飞出屏幕。
-    // 所以改走 `LogicalPosition` 这条不做换算的路，缩放率从显示器上取——那是不依赖窗口
-    // 是否已摆上屏幕的。（窗口若被拖到另一块不同缩放的屏上，用的仍是原来那块的值。）
-    let scale = window
+    // 配置里存的就是**逻辑坐标**（见 `remember_window_position`），这里直接照搬，
+    // 不再做任何缩放换算。
+    //
+    // 从前这里要除以 `current_monitor()` 的缩放率，而那个读给的是「窗口眼下在哪块屏」
+    // ——启动那一刻窗口刚建在主屏上，恒为 2.0。于是外接屏（缩放 1.0）上记下的位置
+    // 会被再除一次 2，窗口落到两块屏之间的空处：宠物确实在显示，但哪儿都看不见。
+    // 那次事故的实际坐标是 1220, -144——主屏 1470×956 @2 与外接 1920×1080 @1
+    // 谁都不覆盖它。
+    let (x, y) = usable_position(&window, f64::from(x), f64::from(y), f64::from(cfg.size));
+    if let Err(err) = window.set_position(tauri::LogicalPosition::new(x, y)) {
+        log::warn!("恢复窗口位置失败：{err}");
+    }
+}
+
+/// 配置里的位置要是落在所有显示器之外，就换成主屏可见处。
+///
+/// 拔掉外接屏、改过分辨率之后旧坐标就可能落在没有画面的空处——那里宠物照样
+/// 显示，但哪儿都看不见，用户只能去改配置文件。查不出显示器（列表为空）时一律
+/// 照旧，不乱动：那种情况下「不在屏上」这个判断本身就不成立。
+fn usable_position(window: &tauri::WebviewWindow, x: f64, y: f64, pet_size: f64) -> (f64, f64) {
+    let monitors = monitor_boxes(window);
+    if monitors.is_empty() || placement::lands_on_any(&monitors, x, y) {
+        return (x, y);
+    }
+    match fallback_position(window, pet_size) {
+        Some(target) => {
+            log::warn!(
+                "窗口位置 ({x}, {y}) 不在任何显示器上，改放到主屏 ({}, {})",
+                target.0,
+                target.1
+            );
+            target
+        }
+        None => {
+            log::warn!("窗口位置 ({x}, {y}) 不在任何显示器上，又查不到主屏，位置保持不变");
+            (x, y)
+        }
+    }
+}
+
+/// 主屏右下角的兜底落点。拿不到主屏信息就返回 `None`。
+fn fallback_position(window: &tauri::WebviewWindow, pet_size: f64) -> Option<(f64, f64)> {
+    let monitor = window.primary_monitor().ok().flatten()?;
+    let origin = monitor.position();
+    let size = monitor.size();
+    let primary = placement::MonitorBox::from_physical(
+        (origin.x, origin.y),
+        (size.width, size.height),
+        monitor.scale_factor(),
+    );
+    Some(placement::fallback_in(&primary, pet_size, PET_MARGIN))
+}
+
+/// 眼下这些显示器在逻辑坐标系里的矩形。查不到就给个空表，让调用方别做判断。
+fn monitor_boxes(window: &tauri::WebviewWindow) -> Vec<placement::MonitorBox> {
+    let Ok(monitors) = window.available_monitors() else {
+        return Vec::new();
+    };
+    monitors
+        .iter()
+        .map(|monitor| {
+            let origin = monitor.position();
+            let size = monitor.size();
+            placement::MonitorBox::from_physical(
+                (origin.x, origin.y),
+                (size.width, size.height),
+                monitor.scale_factor(),
+            )
+        })
+        .collect()
+}
+
+/// 窗口眼下所在那块屏的缩放率。查不到就按 1.0 算。
+fn monitor_scale(window: &tauri::WebviewWindow) -> f64 {
+    window
         .current_monitor()
         .or_else(|_| window.primary_monitor())
         .ok()
         .flatten()
         .map(|monitor| monitor.scale_factor())
-        .unwrap_or(1.0);
-    let logical = tauri::LogicalPosition::new(f64::from(x) / scale, f64::from(y) / scale);
-    if let Err(err) = window.set_position(logical) {
-        log::warn!("恢复窗口位置失败：{err}");
-    }
+        .unwrap_or(1.0)
 }
 
 /// 启动时按配置摆好窗口。
@@ -526,6 +593,10 @@ fn apply_startup_window(app: &tauri::AppHandle) {
 ///
 /// `Moved` 在拖动过程中每秒会来几十条，逐条写盘既浪费又没必要，所以交给一个后台线程
 /// 合并：收到第一条后继续吃到「安静下来」为止，只落盘最后那个位置。
+///
+/// 落盘的是**逻辑坐标**：`Moved` 的物理像素在事件回调里就除以了窗口所在那块屏的
+/// 缩放率。存物理值会让「下次启动该用哪个缩放率」变成一次赌博，赌错就把宠物摆到
+/// 两块屏之间的空处去（那次事故见 `apply_window_config`）。
 fn remember_window_position(app: tauri::AppHandle) {
     // 安静多久算落定。太短会写很多次，太长会让「快速拖完松手」的位置丢掉。
     const QUIET: Duration = Duration::from_millis(300);
@@ -534,10 +605,18 @@ fn remember_window_position(app: tauri::AppHandle) {
         return;
     };
     let (tx, rx) = std::sync::mpsc::channel::<(i32, i32)>();
+    let scale_window = window.clone();
     window.on_window_event(move |event| {
         if let WindowEvent::Moved(position) = event {
+            // `Moved` 报的是**物理**像素，除以窗口所在那块屏的缩放率才是逻辑坐标。
+            // 换算必须在这里做：缩放率随窗口被拖到哪块屏而变，事后（或换个线程）
+            // 就查不到「当时那块屏」了。在主线程上调 `current_monitor` 是内联执行的
+            // （tauri-runtime-wry 的 `send_user_message` 判了主线程 id），不会把
+            // 事件循环堵住。
+            let logical =
+                placement::to_logical((position.x, position.y), monitor_scale(&scale_window));
             // 接收端已退出说明正在收尾，这里失败是正常的，不吵。
-            let _ = tx.send((position.x, position.y));
+            let _ = tx.send(logical);
         }
     });
     std::thread::spawn(move || {
@@ -545,15 +624,18 @@ fn remember_window_position(app: tauri::AppHandle) {
             while let Ok(next) = rx.recv_timeout(QUIET) {
                 latest = next;
             }
-            if let Err(err) = store_position(latest) {
+            if let Err(err) = store_position(latest.0, latest.1) {
                 log::warn!("记住窗口位置失败：{err:#}");
             }
         }
     });
 }
 
-/// 写回窗口位置。读-改-写：只动 `x`/`y`，不碰同一时刻别人改过的字段。
-fn store_position((x, y): (i32, i32)) -> Result<()> {
+/// 把窗口位置写回配置。读-改-写：只动 `x`/`y`，不碰同一时刻别人改过的字段。
+///
+/// 两个坐标都必须是**逻辑坐标**：从 `Moved` 的物理像素到逻辑坐标的换算在
+/// `remember_window_position` 的事件回调里就做完了，这里只负责落盘。
+fn store_position(x: i32, y: i32) -> Result<()> {
     let (mut cfg, _) = config::load_or_init()?;
     cfg.x = Some(x);
     cfg.y = Some(y);
@@ -734,6 +816,7 @@ fn build_tray(app: &tauri::AppHandle, alerts: AlertSlot, port: u16, presence: Ar
     let built = (|| -> Result<()> {
         let show = MenuItem::with_id(app, "show", "显示宠物", true, None::<&str>)?;
         let hide = MenuItem::with_id(app, "hide", "隐藏宠物", true, None::<&str>)?;
+        let recenter = MenuItem::with_id(app, "recenter", "回到主屏", true, None::<&str>)?;
         let settings = MenuItem::with_id(app, "settings", "设置…", true, None::<&str>)?;
         let test = MenuItem::with_id(app, "test", "测试提醒", true, None::<&str>)?;
         let open_pets = MenuItem::with_id(app, "pets", "打开宠物目录", true, None::<&str>)?;
@@ -743,6 +826,7 @@ fn build_tray(app: &tauri::AppHandle, alerts: AlertSlot, port: u16, presence: Ar
             &[
                 &show,
                 &hide,
+                &recenter,
                 &PredefinedMenuItem::separator(app)?,
                 &settings,
                 &test,
@@ -759,6 +843,7 @@ fn build_tray(app: &tauri::AppHandle, alerts: AlertSlot, port: u16, presence: Ar
             .on_menu_event(move |app, event| match event.id().as_ref() {
                 "show" => show_pet_manually(app, &presence),
                 "hide" => hide_pet_manually(app, &presence),
+                "recenter" => recenter_pet(app),
                 "settings" => open_config_window(app),
                 "test" => fire_test_alert(&alerts),
                 "pets" => reveal_pets_dir(),
@@ -821,6 +906,35 @@ fn set_pet_visible(app: &tauri::AppHandle, visible: bool) {
     if let Err(err) = result {
         log::warn!("切换宠物窗口可见性失败：{err}");
     }
+}
+
+/// 托盘「回到主屏」：把宠物摆回主屏右下角并落盘。
+///
+/// 只挪位置、不动显隐：看不见可能是「宿主都断了」的自动结果，也可能是用户自己按的
+/// 「隐藏宠物」，这里顺手把它显示出来会跟那两套规则打架；真要显示，上一条就是了。
+fn recenter_pet(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+        log::warn!("找不到主窗口 {MAIN_WINDOW}，无法回到主屏");
+        return;
+    };
+    let Ok((cfg, _)) = config::load_or_init() else {
+        log::warn!("读配置失败，无法回到主屏");
+        return;
+    };
+    let Some((x, y)) = fallback_position(&window, f64::from(cfg.size)) else {
+        log::warn!("查不到主屏，无法回到主屏");
+        return;
+    };
+    if let Err(err) = window.set_position(tauri::LogicalPosition::new(x, y)) {
+        log::warn!("回到主屏失败：{err}");
+        return;
+    }
+    // `Moved` 随后会把新位置记进配置；这里再写一次是为了窗口正被藏起来、收不到
+    // 移动事件时也能落盘。
+    if let Err(err) = store_position(x.round() as i32, y.round() as i32) {
+        log::warn!("记住新位置失败：{err:#}");
+    }
+    log::info!("宠物已摆回主屏 ({x}, {y})");
 }
 
 /// 从托盘发一条测试提醒，结果写日志（托盘没有地方显示返回值）。

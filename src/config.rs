@@ -46,10 +46,10 @@ pub struct Config {
     /// 当前宠物包 id；`None` 表示取 `pets/` 下第一个可用包。
     #[serde(default)]
     pub pet: Option<String>,
-    /// 窗口横向位置（屏幕坐标）。
+    /// 窗口横向位置（屏幕**逻辑坐标**，不是物理像素；`None` 表示交给系统默认位置）。
     #[serde(default)]
     pub x: Option<i32>,
-    /// 窗口纵向位置（屏幕坐标）。
+    /// 窗口纵向位置（屏幕**逻辑坐标**，不是物理像素；`None` 表示交给系统默认位置）。
     #[serde(default)]
     pub y: Option<i32>,
     /// 窗口边长（像素）。
@@ -672,7 +672,13 @@ mod tests {
     /// 一个填错的 token 不该让人连宠物都看不见。
     #[test]
     fn unusable_token_locks_the_gate_instead_of_blocking_startup() {
-        for token in ["我自己的口令", " has-space", "has space", "tab\there", "   "] {
+        for token in [
+            "我自己的口令",
+            " has-space",
+            "has space",
+            "tab\there",
+            "   ",
+        ] {
             let cfg = Config {
                 auth: AuthConfig {
                     token: token.to_string(),
