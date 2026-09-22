@@ -4,5 +4,31 @@
   "description": "机警又耐心的黑猫巡检员，陪你定位根因、审查改动、守护每一次交付。",
   "spritesheetPath": "spritesheet.webp",
   "spriteVersionNumber": 2,
-  "kind": "animal"
+  "kind": "animal",
+  "litepet": {
+    "schemaVersion": 1,
+    "behavior": {
+      "idleTimeoutMs": 90000,
+      "groups": {
+        "idle": ["idle"],
+        "working": ["running"],
+        "resting": ["idle"],
+        "feedback": ["jumping"]
+      },
+      "rules": [
+        {
+          "on": "agent.end",
+          "when": { "success": false },
+          "play": "failed",
+          "alert": { "sound": "@failed", "desktop": true, "push": true }
+        },
+        { "on": "tool.start", "play": "waiting" },
+        { "on": "tool.end", "play": "group:working" },
+        {
+          "on": "agent.settled",
+          "alert": { "sound": "@done", "desktop": true, "push": true }
+        }
+      ]
+    }
+  }
 }
