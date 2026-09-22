@@ -14,10 +14,6 @@
     <main>
       <section>
         <h2>宠物</h2>
-        <p class="hint">
-          从 <code id="pets-root">~/.litepet/pets</code> 读取。坏包也会列出来，
-          并说明坏在哪。
-        </p>
         <ul class="pets" id="pets"></ul>
       </section>
 
@@ -36,10 +32,6 @@
 
       <section>
         <h2>提醒</h2>
-        <p class="hint">
-          哪些事件要提醒由宠物包的规则表决定，这里只管通道开关。
-          「人在不在」由 pi / dsh 自己判断，litepet 不问。
-        </p>
         <label class="row">
           <input id="notify-enabled" type="checkbox" />
           <span>启用提醒（关掉则整层静默）</span>
@@ -89,12 +81,6 @@
 
       <section>
         <h2>宿主接入</h2>
-        <p class="hint">
-          宿主（pi / dsh）用 <code>http://127.0.0.1:&lt;端口&gt;/rpc</code> 连过来，
-          端口与 token 从 <code>~/.litepet/daemon.json</code> 读。
-          <b>填了 token 就要求请求带 <code>Authorization: Bearer &lt;token&gt;</code>；留空则不鉴权。</b>
-          这一页只管“请求要不要带凭据”，跟窗口、托盘、宠物都不相干——token 填错了也只是宿主连不上。
-        </p>
         <div class="row">
           <span class="label">API token</span>
           <input

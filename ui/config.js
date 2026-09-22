@@ -61,16 +61,18 @@ function fill(config) {
 }
 
 /**
- * 鉴权状态的一句话说明。
+ * 鉴权状态的说明：**只在出问题时给话**。
  *
- * 只有 token 一个字段，所以这里只有三种情形：没填（不鉴权）、填了但用不了、填好了。
+ * 只有 token 一个字段，所以只有两种情形需要说话：填了但用不了、填好了。
+ * 没填（= 不鉴权）返回空串——“留空就不鉴权”这句由输入框的 placeholder 表达，
+ * 状态位再写一遍是多余的。
  * 规则是 `src/config.rs` 里 `Config::auth_gate` 的镜像——那边才是权威，
- * 这里再算一遍是因为「宿主一定连不上」和「接口对本机全开」这两种状态
- * 必须在**改完当场**就能看见，而不是等重启之后去翻日志。改规则时两处一起改。
+ * 这里再算一遍是因为「宿主一定连不上」必须在**改完当场**就能看见，
+ * 而不是等重启之后去翻日志。改规则时两处一起改。
  */
 function authStateHint(auth) {
   if (auth.token === '') {
-    return '留空 = 不鉴权：接口只绑回环，但本机上任何程序（包括浏览器里的网页）都能连。';
+    return '';
   }
   // 可见 ASCII 且不含空白，与 Rust 侧的 `is_ascii_graphic` 同义。
   if (!/^[\x21-\x7e]+$/.test(auth.token)) {
@@ -257,7 +259,6 @@ async function testAlert() {
 
 /** 渲染路径信息。 */
 function renderPaths(info) {
-  el('pets-root').textContent = info.petsRoot ?? '未知';
   const rows = [
     ['家目录', info.home],
     ['宠物目录', info.petsRoot],

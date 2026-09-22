@@ -291,6 +291,7 @@ check(
 
 // 9. 清空 token = 不鉴权：这是唯一表达「不要鉴权」的摆法（没有额外开关），
 // patch 里就是一个空串——两头的空白先被 trim 掉。
+// 这时状态位不再重复「不鉴权」：那句话由输入框的 placeholder 表达。
 registry.get('auth-token').value = '   ';
 await Promise.all(registry.get('auth-token').fire('change'));
 await settle();
@@ -300,8 +301,12 @@ check(
   `清空后补丁里的 token 应是空串，实际 ${JSON.stringify(authPatch)}`,
 );
 check(
-  registry.get('auth-out').textContent.includes('不鉴权'),
-  `清空后应报「不鉴权」，实际「${registry.get('auth-out').textContent}」`,
+  registry.get('auth-out').textContent.trim() === '',
+  `清空后状态位不该再重复「不鉴权」，实际「${registry.get('auth-out').textContent}」`,
+);
+check(
+  /id="auth-token"[\s\S]*?placeholder="留空 = 不鉴权"/.test(html),
+  '「留空 = 不鉴权」现在只由 auth-token 的 placeholder 表达，不能删',
 );
 
 if (failures.length) {
