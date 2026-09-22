@@ -791,7 +791,10 @@ mod tests {
     /// 关掉鉴权后，任何请求都不再需要 `Authorization` 头。
     #[test]
     fn open_gate_admits_without_any_header() {
-        assert!(admit(&AuthGate::Open, None).is_ok(), "没填 token 时缺头也要放行");
+        assert!(
+            admit(&AuthGate::Open, None).is_ok(),
+            "没填 token 时缺头也要放行"
+        );
         assert!(admit(&AuthGate::Open, Some("Bearer 随便什么")).is_ok());
     }
 
@@ -819,7 +822,10 @@ mod tests {
             "两头多余空白应当容忍"
         );
         assert_eq!(admit(&gate, None).expect_err("缺头").0, 401);
-        assert_eq!(admit(&gate, Some("Bearer wrong")).expect_err("值不对").0, 401);
+        assert_eq!(
+            admit(&gate, Some("Bearer wrong")).expect_err("值不对").0,
+            401
+        );
         assert_eq!(
             admit(&gate, Some(TOKEN)).expect_err("少 `Bearer ` 前缀").0,
             401

@@ -460,7 +460,6 @@ impl Session {
         self.last = Some(directive.clone());
         Outcome::Display(Box::new(directive))
     }
-
 }
 
 /// 系统通知的标题。
@@ -979,7 +978,12 @@ mod tests {
         // 这里 tick 可能因为 `idleTimeoutMs` 返回 `Display`——那只是换动作，跟退出无关。
         let later = now + Duration::from_secs(86_400);
         session.tick(later);
-        send(&mut session, protocol::method::HOST_HELLO, hello("dsh"), later);
+        send(
+            &mut session,
+            protocol::method::HOST_HELLO,
+            hello("dsh"),
+            later,
+        );
         assert_eq!(session.host_count(), 1);
     }
 
@@ -1021,7 +1025,12 @@ mod tests {
         // 从未有宿主连过：空转再久，新宿主随时能连上。
         let later = now + Duration::from_secs(86_400);
         session.tick(later);
-        send(&mut session, protocol::method::HOST_HELLO, hello("pi"), later);
+        send(
+            &mut session,
+            protocol::method::HOST_HELLO,
+            hello("pi"),
+            later,
+        );
         assert_eq!(session.host_count(), 1);
     }
 
