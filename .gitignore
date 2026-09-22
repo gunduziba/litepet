@@ -8,3 +8,6 @@ target/
 
 # tauri-build 生成的 ACL schema，不入库
 gen/
+
+# 本地工作目录：构建脚本、日志与项目记忆，不入库
+.workbuddy/
