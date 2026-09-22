@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write as _;
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -26,7 +27,8 @@ const LOGS_DIR: &str = "logs";
 const ENDPOINT_FILE: &str = "daemon.json";
 /// 默认 HTTP 端口。
 pub const DEFAULT_PORT: u16 = 4590;
-/// 含密钥文件的权限位。
+/// 含密钥文件的权限位。Windows 没有 POSIX 权限位，那边不设（见 `write_private_body`）。
+#[cfg(unix)]
 const PRIVATE_MODE: u32 = 0o600;
 /// 默认窗口边长（像素）。
 const DEFAULT_SIZE: u32 = 220;
@@ -321,8 +323,32 @@ pub fn home_dir() -> Result<PathBuf> {
     if let Some(raw) = std::env::var_os(HOME_ENV) {
         return Ok(PathBuf::from(raw));
     }
-    let home = std::env::var_os("HOME").context("环境变量 HOME 缺失，无法定位家目录")?;
-    Ok(PathBuf::from(home).join(DEFAULT_HOME_DIR))
+    let home = home_from_env().context("找不到用户家目录：HOME 与 USERPROFILE 都缺失")?;
+    Ok(home.join(DEFAULT_HOME_DIR))
+}
+
+/// 从环境变量里找用户家目录。
+///
+/// **不能只认 `HOME`**：那是 POSIX 的约定，Windows 默认**根本不设它** —— 从资源管理器
+/// 双击启动、或由宿主进程直接拉起时都拿不到，只有 git-bash / MSYS 这类 shell 会自己补一个。
+/// 那边真正的变量是 `USERPROFILE`；个别被裁剪过的环境里还会拆成 `HOMEDRIVE` + `HOMEPATH`。
+fn home_from_env() -> Option<PathBuf> {
+    let non_empty = |key: &str| std::env::var_os(key).filter(|value| !value.is_empty());
+
+    if let Some(home) = non_empty("HOME") {
+        return Some(PathBuf::from(home));
+    }
+    #[cfg(windows)]
+    if let Some(profile) = non_empty("USERPROFILE") {
+        return Some(PathBuf::from(profile));
+    }
+    #[cfg(windows)]
+    if let (Some(drive), Some(path)) = (non_empty("HOMEDRIVE"), non_empty("HOMEPATH")) {
+        let mut home = PathBuf::from(drive);
+        home.push(path);
+        return Some(home);
+    }
+    None
 }
 
 /// 宠物包根目录 `~/.litepet/pets`。
@@ -444,16 +470,19 @@ fn write_private(path: &Path, body: &str) -> Result<()> {
 ///
 /// `mode()` 只在创建时生效，因此已有文件额外补一次 `set_permissions`，
 /// 避免「上一次残留了权限过宽的文件」继承下来。
+///
+/// 权限收窄是 POSIX 概念，Windows 分支不设（那边用 ACL，且 `%USERPROFILE%` 默认
+/// 就只有本用户可写）。
 fn write_private_body(path: &Path, body: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("创建家目录失败：{}", parent.display()))?;
     }
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(PRIVATE_MODE)
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(PRIVATE_MODE);
+    let mut file = opts
         .open(path)
         .with_context(|| format!("写入失败：{}", path.display()))?;
     file.write_all(body.as_bytes())
@@ -462,6 +491,7 @@ fn write_private_body(path: &Path, body: &str) -> Result<()> {
     // 内容空的文件——比截断更难查。
     file.sync_all()
         .with_context(|| format!("落盘失败：{}", path.display()))?;
+    #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_MODE))
         .with_context(|| format!("设置权限失败：{}", path.display()))?;
     Ok(())
@@ -634,6 +664,9 @@ mod tests {
     }
 
     /// 配置里有明文推送密钥，所以必须 0600 落盘。
+    ///
+    /// 权限位是 POSIX 概念，Windows 上跳过。
+    #[cfg(unix)]
     #[test]
     fn config_file_is_owner_only() {
         let dir = std::env::temp_dir().join(format!("litepet-cfg-mode-{}", std::process::id()));
@@ -735,6 +768,9 @@ mod tests {
     }
 
     /// 含密钥的文件必须是 0600，否则同机其他用户能直接拿去驱动别人的宠物。
+    ///
+    /// 权限位是 POSIX 概念，Windows 上跳过。
+    #[cfg(unix)]
     #[test]
     fn private_file_is_owner_only() {
         let dir = std::env::temp_dir().join(format!(

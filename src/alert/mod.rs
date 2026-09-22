@@ -624,12 +624,20 @@ mod tests {
     /// 只给声音的规格不该顺手把通知与推送也发出去。
     #[test]
     fn sound_only_spec_rings_alone() {
-        let (recorder, alerter) = alerter(cfg(), None);
+        // 指一个真文件：`@done` 的最后一层兜底是**系统音效**，而候选名逐平台不同
+        // （macOS 的 `Glass.aiff` 在 Windows 的 `Media` 目录里不存在，那边叫
+        // `Windows Notify.wav`）。这条用例只验「只响一声」，不该被平台差异绊住。
+        let (pack_root, file) = temp_sound_pack("sound-only");
+        let mut config = cfg();
+        config.sound.files.done = file.display().to_string();
+
+        let (recorder, alerter) = alerter(config, Some(pack_root.clone()));
         let actions = alerter.dispatch(&request(Some("@done"), false, false));
         assert!(actions.sound.is_some());
         assert_eq!(recorder.sounds.lock().expect("锁").len(), 1);
         assert!(recorder.desktop.lock().expect("锁").is_empty());
         assert!(recorder.push.lock().expect("锁").is_empty());
+        std::fs::remove_dir_all(&pack_root).ok();
     }
 
     #[test]

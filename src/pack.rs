@@ -390,7 +390,8 @@ mod tests {
         }"#;
         let (root, _) = make_pack("solo", manifest);
         let err = load(&root, "kun-signature").expect_err("应报缺失清单");
-        let text = format!("{err:#}");
+        // 路径按平台分隔符拼（Windows 是 `\`）；断言前统一成 `/`，免得假失败。
+        let text = format!("{err:#}").replace('\\', "/");
         assert!(text.contains("缺失清单文件"), "{text}");
         assert!(text.contains("kun-signature/pet.json"), "{text}");
         let _ = fs::remove_dir_all(root.parent().expect("有父目录"));
@@ -499,10 +500,11 @@ mod tests {
     /// 目录不存在时跳过，保证在干净环境下也能跑。
     #[test]
     fn local_real_packs_load_if_present() {
-        let Some(home) = std::env::var_os("HOME") else {
+        // 走 `config::pets_dir` 而不是自己读 `HOME`：Windows 上 `HOME` 是空的，
+        // 这条用例本来会「静默跳过」——而它是唯一碰到真实 WebP 头的用例，不该空转。
+        let Ok(root) = crate::config::pets_dir() else {
             return;
         };
-        let root = PathBuf::from(home).join(".litepet").join("pets");
         let Ok(entries) = fs::read_dir(&root) else {
             return;
         };
