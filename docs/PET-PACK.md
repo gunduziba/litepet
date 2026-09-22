@@ -178,6 +178,10 @@ Rust 侧 `collect_asset_paths` 分三支校验，错误串可直接复用：`"pe
 └── spritesheet.webp  ← 透明 WebP 图集（路径由 pet.json 指定）
 ```
 
+**目录名才是包的规范身份，清单里的 `id` 只用于展示。** 两者可以不同：从 codex-pets.net 之类的地方下载来的包，解出来的目录名常带后缀（`kun-signature.codex-pet/`），而清单里写的 `id` 是 `kun-signature`。
+
+所以 `pet/list` 的每一项同时给 `dir`（目录名，切换时传这个）与 `id`（清单值，用于显示）；daemon 侧 `pack::resolve_dir` 两者都认——先按目录名找，找不到再扫一遍目录比对清单 `id`。几个包的清单 `id` 撞车时报错并列出候选目录，不猜。
+
 ### 3.2 清单 `PetFile`（`model.rs:116-128`）
 
 **六个字段，全部可缺省**（`id` 到 `animations` 都带 `#[serde(default)]`，`frame` 是 `Option`）。因此 `pet.json` 内容为 `{}` 在语法上合法。

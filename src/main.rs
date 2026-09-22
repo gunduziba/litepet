@@ -226,11 +226,17 @@ fn copy_missing_pack_files(source: &Path, destination: &Path) -> Result<usize> {
     Ok(copied)
 }
 
-/// 选中要加载的包 id：优先配置指定，否则取 `pets/` 下第一个可用包。
+/// 选中要加载的包：优先配置指定，否则取 `pets/` 下第一个可用包。
+///
+/// 返回**目录名**。配置里可能存着清单 id 而不是目录名（`pet/switch` 记的是
+/// 清单 id），所以先过一遍 [`pack::resolve_dir`]，再把结果收敛成目录名——
+/// 后续一律按目录名走。
 fn pick_pack(root: &Path, preferred: Option<&str>) -> Option<String> {
     if let Some(id) = preferred {
-        if root.join(id).join("pet.json").is_file() {
-            return Some(id.to_string());
+        if let Ok(dir) = pack::resolve_dir(root, id) {
+            return dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
         }
         log::warn!("配置的宠物包不可用，回退到自动挑选：{id}");
     }

@@ -97,16 +97,61 @@ pub struct LoadedPet {
     pub root: PathBuf,
 }
 
+/// 把「宠物包标识」解析成实际的包目录。
+///
+/// 有两个名字都像 id（`docs/PET-PACK.md` §3.1）：
+///
+/// - **目录名**：规范身份。`PetSummary::dir`、配置里的 `pet`、切换请求都用它。
+/// - **清单里的 `id`**：展示用。Codex 社区下载来的包常带后缀目录
+///   （`kun-signature.codex-pet/`），此时目录名与清单 id 并不相同。
+///
+/// 所以先按目录名直接找，找不到再扫一遍目录比对清单 id。都命不中时仍报
+/// 「缺失清单文件」，指向按目录名拼出来的那个路径——那是用户最可能自己
+/// 去看的地方。几个包的清单 id 撞车时报错而不是挑一个：挑错会加载成另一个
+/// 宠物，比明确失败难查得多。
+pub fn resolve_dir(pets_root: &Path, id: &str) -> Result<PathBuf> {
+    let direct = pets_root.join(id);
+    if direct.join(PET_FILE).is_file() {
+        return Ok(direct);
+    }
+    let mut matched: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = fs::read_dir(pets_root) {
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if !path.join(PET_FILE).is_file() {
+                continue;
+            }
+            let declared = manifest::PetFile::from_path(&path.join(PET_FILE))
+                .ok()
+                .and_then(|file| file.id);
+            if declared.as_deref() == Some(id) {
+                matched.push(path);
+            }
+        }
+    }
+    match matched.len() {
+        1 => Ok(matched.remove(0)),
+        0 => bail!("缺失清单文件：{}", direct.join(PET_FILE).display()),
+        count => {
+            let names: Vec<String> = matched
+                .iter()
+                .filter_map(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect();
+            bail!(
+                "有 {count} 个宠物包的清单 id 都是 {id}，请改用目录名区分：{}",
+                names.join("、")
+            )
+        }
+    }
+}
+
 /// 从 `pets/<id>/` 加载一个包。
 ///
 /// `pets_root` 为宠物包根目录，用于阻挡 `spritesheetPath` 逃出包目录。
+/// `id` 可以是目录名，也可以是清单里的 `id`，见 [`resolve_dir`]。
 pub fn load(pets_root: &Path, id: &str) -> Result<LoadedPet> {
-    let dir = pets_root.join(id);
-    let manifest_path = dir.join(PET_FILE);
-    if !manifest_path.is_file() {
-        bail!("缺失清单文件：{}", manifest_path.display());
-    }
-    let file = manifest::PetFile::from_path(&manifest_path)?;
+    let dir = resolve_dir(pets_root, id)?;
+    let file = manifest::PetFile::from_path(&dir.join(PET_FILE))?;
 
     let sheet = resolve_spritesheet(&dir, pets_root, file.spritesheet_path.as_deref())?;
     let atlas = image::read_size(&sheet)?;
@@ -137,9 +182,11 @@ pub fn load(pets_root: &Path, id: &str) -> Result<LoadedPet> {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PetSummary {
-    /// 目录名；`load` 用它作为清单缺 `id` 时的兜底。
+    /// 目录名，即包的规范身份；`load` 用它作为清单缺 `id` 时的兜底。
+    ///
+    /// 与 `id` 可能不同：Codex 社区的包常带后缀目录（`kun-signature.codex-pet/`）。
     pub dir: String,
-    /// 清单里的 id；缺省时回落成目录名（与 `load` 的取值一致）。
+    /// 清单里的 id，展示用；缺省时回落成目录名（与 `load` 的取值一致）。
     pub id: String,
     pub display_name: String,
     pub description: String,
@@ -297,6 +344,82 @@ mod tests {
         assert_eq!(loaded.info.animations.len(), 16);
         assert!(loaded.behavior.is_none(), "纯 Codex 包没有 litepet 键");
         let _ = fs::remove_dir_all(root.parent().expect("有父目录"));
+    }
+
+    /// 目录名带社区后缀时，清单里的 `id` 也要能当标识用。
+    #[test]
+    fn manifest_id_resolves_when_dir_name_differs() {
+        let manifest = r#"{
+            "id": "kun-signature",
+            "displayName": "KUN·练习生",
+            "spritesheetPath": "spritesheet.png",
+            "spriteVersionNumber": 2,
+            "kind": "animal"
+        }"#;
+        let (root, dir) = make_pack("kun-signature.codex-pet", manifest);
+        // 真实包的图集是 1536x1872（9 行）且不声明 spriteVersionNumber，
+        // 网格靠像素反推：1536/192=8、1872/208=9。
+        write_atlas(&root.join(&dir).join("spritesheet.png"), 1536, 1872);
+        // 目录名是规范身份，照旧可用
+        let by_dir = load(&root, &dir).expect("目录名应能加载");
+        assert_eq!(by_dir.info.id, "kun-signature");
+        assert_eq!(
+            (
+                by_dir.info.frame.width,
+                by_dir.info.frame.height,
+                by_dir.info.frame.columns,
+                by_dir.info.frame.rows
+            ),
+            (192, 208, 8, 9)
+        );
+        assert_eq!(by_dir.info.animations.len(), 14, "idle + 13 个具名动作");
+        // 清单 id 也能加载，且落到同一个包目录
+        let loaded = load(&root, "kun-signature").expect("清单 id 应解析到包目录");
+        assert_eq!(loaded.info.id, "kun-signature");
+        assert_eq!(loaded.root, root.join("kun-signature.codex-pet"));
+        let _ = fs::remove_dir_all(root.parent().expect("有父目录"));
+    }
+
+    /// 谁也不匹配时报「缺失清单文件」，且路径按目录名拼（用户会去那儿找）。
+    #[test]
+    fn unknown_id_reports_missing_manifest() {
+        let manifest = r#"{
+            "id": "solo",
+            "spritesheetPath": "spritesheet.png",
+            "spriteVersionNumber": 2
+        }"#;
+        let (root, _) = make_pack("solo", manifest);
+        let err = load(&root, "kun-signature").expect_err("应报缺失清单");
+        let text = format!("{err:#}");
+        assert!(text.contains("缺失清单文件"), "{text}");
+        assert!(text.contains("kun-signature/pet.json"), "{text}");
+        let _ = fs::remove_dir_all(root.parent().expect("有父目录"));
+    }
+
+    /// 两个包声明同一个清单 id 时宁可报错，也不猜一个去加载。
+    #[test]
+    fn duplicate_manifest_id_is_rejected() {
+        let root = std::env::temp_dir().join(format!("{TEST_ROOT}-duplicate-id"));
+        let _ = fs::remove_dir_all(&root);
+        let pets = root.join("pets");
+        let manifest = r#"{
+            "id": "kun-signature",
+            "spritesheetPath": "spritesheet.png",
+            "spriteVersionNumber": 2
+        }"#;
+        for dir in ["kun-signature.codex-pet", "kun-signature-copy"] {
+            let pack = pets.join(dir);
+            fs::create_dir_all(&pack).expect("建目录失败");
+            fs::write(pack.join(PET_FILE), manifest).expect("写清单失败");
+        }
+        let err = resolve_dir(&pets, "kun-signature").expect_err("撞车应报错");
+        let text = format!("{err:#}");
+        assert!(text.contains("2 个"), "{text}");
+        assert!(text.contains("kun-signature.codex-pet"), "{text}");
+        assert!(text.contains("kun-signature-copy"), "{text}");
+        // 目录名仍然精确可用
+        assert!(resolve_dir(&pets, "kun-signature-copy").is_ok());
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// `litepet` 键必须原样透出，且不影响 Codex 字段的解析。

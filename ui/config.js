@@ -245,18 +245,22 @@ function renderPets(pets) {
         badge.textContent = '当前';
         item.append(badge);
       }
-      item.addEventListener('click', () => selectPet(summary.id));
+      // 传目录名（`dir`）而不是清单 id：目录名才是包的规范身份。清单 id
+      // 可能与目录名不同（Codex 社区的包常带 `.codex-pet` 后缀），拿它去
+      // 切换会被解析成另一个路径。
+      item.addEventListener('click', () => selectPet(summary.dir, summary.displayName));
     }
     list.append(item);
   }
 }
 
 /** 切换宠物包：当场生效（daemon 会换规则表并让渲染层重载图集）。 */
-async function selectPet(id) {
+async function selectPet(id, label) {
   try {
     await rpc('pet/select', { id });
     await refreshPets();
-    toast(`已切换到 ${id}`);
+    // 提示用展示名：`id` 是目录名，可能带 `.codex-pet` 这类后缀，给人看很怪。
+    toast(`已切换到 ${label ?? id}`);
   } catch (err) {
     toast(String(err), true);
   }
