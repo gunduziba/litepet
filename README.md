@@ -12,7 +12,7 @@ LitePet 是一个专为 AI 编程工具（如 [pi](https://github.com/earendil-w
 - **流畅的轻量渲染**：基于 Tauri 2 构建，透明置顶小窗，基于 Animated WebP 精准切图渲染，资源占用极低。
 - **协议中立与解耦**：宿主与宠物之间通过本地回环标准的 **HTTP + JSON-RPC 2.0** 通信，不强绑定任何特定工具的代码，极易扩展。
 - **多通道任务提醒**：支持规则驱动的音效提醒（本地音频播放）、系统桌面通知与 Bark 手机推送。无论离开工位还是切换全屏，都能及时知道 Agent 何时真正收工。
-- **可自定义宠物包**：支持换肤与多形象管理，遵循开放包规范，动画图集与触发规则皆可通过 `pet.json` 自由定制。
+- **兼容 Codex 宠物包标准**：原生兼容官方与社区的 Codex 宠物图集规范（`spritesheet.webp` + `pet.json`），社区已有形象直接解压即用；同时独家扩展了 Agent 状态机、事件规则映射与多通道提醒（音效/通知/手机推送）。
 
 ---
 
@@ -127,6 +127,77 @@ LitePet 与各类宿主（插件/适配器）之间基于标准的 **HTTP/1.1 + 
 | `host/bye` | 通知 (Notification) | 宿主退出前主动注销，快速释放状态 |
 
 👉 **关于数据包结构、完整方法参数、状态码与多语言调用示例，请查阅**：[LitePet 通信协议规范 (docs/PROTOCOL.md)](docs/PROTOCOL.md)。
+
+---
+
+## 📦 Codex 宠物包兼容与字段扩展
+
+LitePet 原生兼容官方与社区的 **Codex 宠物包标准**（图集 `spritesheet.webp` + 清单 `pet.json`）。任何从社区（如 codex-pets.net）下载的现成宠物包无需二次修改，直接放入 `~/.litepet/pets/` 目录即可无缝加载运行。
+
+### 1. 为什么能够双向无缝兼容？
+- **对纯 Codex 宠物包开箱即用**：Codex 原版标准仅包含通用角色动作（如跳跃、走路等），LitePet 内置了**智能降级映射器**，自动将原生角色动作映射为 Agent 状态（例如将 `running` 映射为工作敲键盘、`waiting` 映射为闲置休息、`bounce` 映射为成功庆祝、`sad` 映射为失败脸色），并提供任务收工音效。
+- **对 Codex 原生环境零干扰**：Codex 官方解析器未开启严格未知字段拦截。LitePet 的所有高级特性均收拢在 `pet.json` 内独立的 `"litepet"` 命名空间中。这意味着**同一份 `pet.json` 清单，既能在 Codex 中正常运行，也能在 LitePet 中展现丰富的 Agent 联动能力**。
+
+### 2. `pet.json` 字段定义与扩展说明
+
+#### ① 基础规范字段（Codex 原生标准）
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | string | 宠物全局唯一标识符 |
+| `displayName` | string | 宠物的展示名称（如“巡检喵”） |
+| `description` | string | 宠物简介与角色描述 |
+| `spritesheetPath` | string | 精灵图集相对路径（通常为 `spritesheet.webp`） |
+| `spriteVersionNumber` | number | 图集版本号（`1` 为 9 行，`2` 为 11 行） |
+| `frame` | object | *可选*。自定义网格单格宽高与行列（如 `{ width: 192, height: 208, columns: 8, rows: 9 }`） |
+| `animations` | object | *可选*。具名动画索引表，声明各动作所引用的精灵图单元格索引数组 `frames` 与 `fps` |
+
+#### ② 行为与提醒扩展字段（LitePet 独家扩展 ✨）
+> **注意**：Codex 原版规范仅定义了静态画面与角色动作，**完全不具备 Agent 状态感知、交互事件驱动与多通道提醒能力**。因此，桌面宠物的业务状态机、事件规则映射与通知机制，均由 LitePet 扩展实现并收拢在 `"litepet"` 字段中：
+
+```jsonc
+{
+  // ... 上方为 Codex 原生基础字段 ...
+  
+  // ↓↓↓ LitePet 独家扩展字段（由 LitePet 读取，Codex 会自动安全忽略）
+  "litepet": {
+    "schemaVersion": 1,
+    "displaySize": 240,            // 宠物小窗渲染像素边长（留空则按单格尺寸）
+    "behavior": {                  // 【行为扩展】Agent 状态机与规则配置
+      "idleTimeoutMs": 90000,      // 无交互事件超过该时长（毫秒）自动进入闲置休息轮换
+      "groups": {                  // 动作语义组：将底层动画归类为 Agent 状态，支持同组轮换
+        "idle": ["idle"],
+        "working": ["typing", "coding"],
+        "resting": ["sleep", "tea_break"],
+        "feedback": ["celebrate", "barbell"]
+      },
+      "rules": [                   // 事件规则表：将 Agent 协议事件映射到动作、头顶气泡与提醒
+        {
+          "on": "agent.start",
+          "play": "group:working",
+          "bubble": { "kind": "status", "text": "开始工作啦" }
+        },
+        {
+          "on": "tool.start",
+          "bubble": { "kind": "tool", "text": "{toolName}" }
+        },
+        {
+          "on": "agent.settled",
+          "play": "group:feedback",
+          "bubble": { "kind": "success", "text": "全部搞定！" },
+          "alert": {               // 多通道提醒：音效、桌面通知、Bark 手机推送
+            "sound": "@done",
+            "desktop": true,
+            "push": true,
+            "text": "{note}"       // 动态获取宿主传入的收工总结
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+👉 **关于精灵索引网格计算、降级映射表与提醒配置的完整规范，请参阅**：[宠物包契约规范 (docs/PET-PACK.md)](docs/PET-PACK.md)。
 
 ---
 
