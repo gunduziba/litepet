@@ -11,7 +11,7 @@
 - **pi**：TUI coding agent（本机已装，文档见 `~/tools/pi-web/node_modules/@earendil-works/pi-coding-agent/docs/`）
 - **dsh**：DeepSeek Harness（`github.com/deepseek-ai/deepseek-harness`，MIT，"Everything is a Plugin"，底层 Cordis 框架，文档 https://deepseek-harness.github.io/deepseek-harness/reference/ ）
 
-产品形态：屏幕角落一只**白鼬**，透明置顶小窗播放 **animated WebP** 动画（素材格式决策见 §3.5）。agent 开始干活 → 切「打字」动画；任务完成 → 举杠铃庆祝；工具调用 → 头顶气泡显示工具名。pi 和 dsh 可同时接入，宠物按仲裁规则显示。
+产品形态：屏幕角落一只**桌面宠物**，透明置顶小窗播放**图集动画**（格式与打包见 `docs/PET-PACK.md` §3、§5）。agent 开始干活 → 切「干活」动作；任务完成 → 庆祝动作；工具调用 → 头顶气泡显示工具名。pi 和 dsh 可同时接入，宠物按仲裁规则显示。
 
 参考实现：Open Vetta 仓库（本机 `/Users/eee/tools/open-vetta`）的桌宠。核心算法直接搬运，具体清单见 §6；**素材需转码**（VP9 webm → animated WebP，见 §3.5、§7）。
 
@@ -158,23 +158,18 @@ interface PetAction {
 }
 ```
 
-动作清单与默认映射（源：`pet-actions.ts` + `session-event-action-policy.ts` 的 `DEFAULT_ACTION_BY_GROUP`）：
+动作组与默认映射（源：`pet-actions.ts` + `session-event-action-policy.ts` 的 `DEFAULT_ACTION_BY_GROUP`）：
 
-> ⚠️ **本节表格已降级为「内置包示例」。** 现采用 **Codex 包格式**（`docs/PET-PACK.md` §3）：动画名由 `pet.json` 的 `animations` 声明、**与文件名解耦**，素材是**单张图集**而非逐动作文件。下表内置包恰好满足「动画名 = 素材文件名」，属巧合而非契约。
+> ⚠️ **本项目没有「内置动作清单」。** 现采用 **Codex 包格式**（`docs/PET-PACK.md` §3）：动画名由包的 `pet.json` 声明、**与素材文件名解耦**，素材是**单张图集**而非逐动作文件。上游那份动作清单留到今天的只有下面四个组，组里放什么动画、叫什么名字全由包决定（§3.8）。
 
-| 组 | 动画名 | 默认 | autoDuration |
-|---|---|---|---|
-| idle | `stoat_spin_color_hula_hoop` | ✅ | 60–120s |
-| working | `stoat_work_laptop_typing_desk_cushion` | ✅ | 180–300s |
-| resting | `stoat_sit_cushion_drink_tea_slow` | ✅ | 120–240s |
-| resting | `stoat_sleep_lie_on_cushion` | | 180–300s |
-| resting | `stoat_listen_music_headphones_nod` | | 60–120s |
-| resting | `stoat_skip_rope_jump` | | 30–60s |
-| feedback | `stoat_stand_lift_barbell_one_hand_fast` | ✅ | 8–12s |
-| feedback | `stoat_wave_backflip_smoke_fade_exit` | | 3–5s |
+| 组 | 含义 |
+|---|---|
+| `idle` | 待机 |
+| `working` | 干活中 |
+| `resting` | 长时间没事件（组内轮换） |
+| `feedback` | 成功 / 失败的那一下 |
 
-> 注 1：上表是**内置包**的动作清单，作为契约的示例数据，**不是不可扩展的固定词表**——外部包可声明任意动作 id（§3.8）。
-> 注 2：上表 autoDuration 数值为设计建议值，Vetta 源码里只对部分动作定义了精确范围；以搬运源码时的实际值为准。
+> 注：上游还给每个动作定了 `autoDuration`（自动模式播多久），这套数值现在已经不用了——节奏改由包的规则表（`docs/PET-PACK.md` §4.3）、组内轮换间隔（`src/arbiter.rs` 的 `GROUP_ROTATE_MS`）和状态机超时（`idleTimeoutMs`）决定，`config.json` 里没有对应字段。
 
 状态机规则（源：`session-event-action-policy.ts` + `PetApp.tsx`）：
 
@@ -347,23 +342,20 @@ L3 是唯一能把 §3.4 「策略逻辑要手写 Rust」这条成本压下去�
 | `apps/desktop/src/shared/pet-actions.ts` | 动作数据模型与清单 |
 | `apps/desktop/src/shared/pet-bubble-styles/*.json` | 气泡换肤 JSON 格式（M5） |
 | `apps/desktop/src/renderer/domains/pet/` | React 前端参考：`PetApp.tsx`（状态编排）、`PetVideoSurface.tsx`、`PetSpeechBubble.tsx`、`usePetBubble.ts`、`usePetPresentationThrottle.ts` |
-| `apps/desktop/build/pet/*.webm` | 8 个白鼬透明视频素材（见 §7 许可）；**需转码为 animated WebP 才能用**（§3.5） |
 
 ## 7. 素材与许可
 
-**两套素材并存，用途不同**（均在本仓库）：
+**仓库里只有这些素材**（`git ls-files assets`）：
 
-| 目录 | 内容 | 体积 | 用途 |
-|---|---|---|---|
-| `assets/pet/` | 8 个 `.webm`（VP9+alpha，302 帧 / 10.066s / 30fps / 576×576） | 5.0 MB | **仅作再生成源**，不参与运行、不打包 |
-| `assets/pet-440/` | 8 个 animated `.webp`（440px/12fps/q80） | 12 MB | **运行用**，`<img>` 直接播放 |
+| 路径 | 内容 | 用途 |
+|---|---|---|
+| `assets/pets/xunjian-miao/` | `pet.json` + `spritesheet.webp`（1536×2288，8 列 × 11 行，单格 192×208） | 内置宠物，随应用打包 |
+| `assets/sounds/@attention.wav`、`@done.wav`、`@failed.wav` | 三个语义槽位的兑底提示音 | 宿主没指定音效时用（`docs/PET-PACK.md` §4.5） |
 
-已逐项验过 `assets/pet-440/*.webp` 均为 `Alpha: 1, Animation: 1`。
-
-- 素材来源：Open Vetta 仓库（Apache-2.0），原始 webm 位于 `apps/desktop/build/pet/`
-- **必须**：在 litepet 项目中保留 Apache-2.0 要求的版权与许可声明；动手前核对 `/Users/eee/tools/open-vetta/NOTICE` 中是否有针对这批素材的额外归属说明（若 NOTICE 把素材列为第三方，则按 NOTICE 归属，不可直接搬）
-- **动作 id 由宠物包 manifest 声明，不得从文件名推断**（§3.8 / `docs/PET-PACK.md` §4）。内置包恰好满足「文件名 = 动作 id」，但外部包允许文件名任意，否则用户无法用自己命名的素材
-- ⚠️ **转码脚本缺失，素材当前不可复现**：`assets/pet-440/` 是早期在 `/tmp` 里一次性用 `img2webp` 生成的，`scripts/` 目录**为空**，仓库内无任何转码代码。M1 动手前必须补 `scripts/transcode-pet-assets.sh`（工具链见 §3.5）
+- 项目整体 Apache-2.0（`LICENSE`）；设计派生自 Open Vetta 桌面端，归属声明见 `NOTICE`
+- **动作 id 由宠物包 manifest 声明，不得从文件名推断**（§3.8 / `docs/PET-PACK.md` §4）。外部包的文件名与动画名允许完全无关，否则用户无法用自己命名的素材
+- ⚠️ **图集不可复现**：`xunjian-miao/spritesheet.webp` 是手工产出的一次性产物，仓库里没有生成它的脚本。要改图集得自己拼（步骤见 `docs/PET-PACK.md` §5）
+- `scripts/` 里只有 `check-ui.mjs`、`ui-fixture.mjs`、`host-sim.mjs`、`preview-ui.mjs` 四个开发/运维脚本，与素材生产无关
 
 ## 8. 里程碑与验收
 

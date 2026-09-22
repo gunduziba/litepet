@@ -27,10 +27,6 @@ layout, bubble constants) is derived from Open Vetta's desktop app
 (`apps/desktop/src/main/pet/`, `apps/desktop/src/shared/pet-*`,
 `apps/desktop/src/renderer/domains/pet/`).
 
-The stoat (白鼬) webm animations under `assets/pet/` are original Open Vetta
-repository content and are redistributed here under Apache-2.0. They are NOT
-listed as third-party material in Open Vetta's NOTICE.
-
 Apache License 2.0 terms are reproduced in the LICENSE file of this project.
 
 --------------------------------------------------------------------------------

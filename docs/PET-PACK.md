@@ -445,9 +445,9 @@ Codex 的 `PetFile` **没有 `deny_unknown_fields`**（§3.2）→ 同一份 `pe
 ```jsonc
 {
   // ↓↓↓ Codex 读的（严格遵循 §3）
-  "id": "stoat",
-  "displayName": "白鼬",
-  "description": "一只在屏幕角陪你写代码的白鼬",
+  "id": "demo-pet",
+  "displayName": "示例宠",
+  "description": "一只在屏幕角陪你写代码的小宠物",
   "spritesheetPath": "spritesheet.webp",
   "frame": { "width": 256, "height": 256, "columns": 8, "rows": 8 },
   "animations": {
@@ -638,7 +638,7 @@ Codex 的 `PetFile` **没有 `deny_unknown_fields`**（§3.2）→ 同一份 `pe
 
 ## 5. 素材生产：从 webp 到图集
 
-Codex 格式要求**单张图集**，而我们现有素材是 8 个独立的 animated WebP（`440×440`，来自 Vetta stoat 系列）。
+Codex 格式要求**单张图集**。手上的素材如果是逐动作的独立动图（每个动作一个 animated WebP 之类），先按下面这套步骤拼成一张。
 
 **打包步骤（一次性、离线、可复现）**：
 

@@ -6,7 +6,7 @@
 
 ## 0. 定位
 
-`litepet` 是一个**单例守护进程**，在屏幕角落显示一只白鼬。
+`litepet` 是一个**单例守护进程**，在屏幕角落显示一只桌面宠物。宠物形象来自宠物包，可随时替换（`docs/PET-PACK.md`）。
 
 - daemon **不认识**任何宿主（pi / dsh / 其他）的代码，只认本协议
 - 多个宿主**打同一个 daemon**，而不是各开一只宠物
@@ -261,18 +261,17 @@ idle ──agent.start──► working ──agent.end(success)──► celebr
 
 组是**我们**的概念（Codex 格式里没有），定义在 `litepet.behavior.groups`（契约见 `docs/PET-PACK.md` §4.2）。组的语义与 `SPEC.md` §3.4 一致，组内多个动画按轮换规则选用。
 
-### 9.2 内置包
+### 9.2 动画名从哪来
 
-下表为**内置包**的动画名（示例数据，**非固定词表**；外部包的动画名由自己的 `pet.json` 决定）：
+**没有固定词表。** daemon 只认组（§9.1），具体放哪个动画一律听包的：
 
-| 组 | 内置默认动画名 |
-|---|---|
-| `idle` | `stoat_spin_color_hula_hoop` |
-| `working` | `stoat_work_laptop_typing_desk_cushion` |
-| `resting` | `stoat_sit_cushion_drink_tea_slow`、`stoat_sleep_lie_on_cushion`、`stoat_listen_music_headphones_nod`、`stoat_skip_rope_jump` |
-| `feedback` | `stoat_stand_lift_barbell_one_hand_fast`、`stoat_wave_backflip_smoke_fade_exit` |
+1. `pet.json` 声明了 `animations` → 用包里的名字；
+2. 没声明 → 用 `docs/PET-PACK.md` §3.7 那张 Codex 缺省表，按图集行号铺出 `idle` + 13 个行名（V2 图集再加 2 个注视方向）；
+3. 组的名字（`idle` / `working` / `resting` / `feedback`）**不是动画名**，要经规则表或 §4.4 的降级映射翻译成动画名。
 
-内置包恰好满足「动画名 = 素材文件名」，但这是**巧合，不是契约**——外部包的文件名与动画名可以完全无关，否则用户无法用自己命名的素材。
+内置的巡检喵（`assets/pets/xunjian-miao/`）走的是第 2 条：它的 `pet.json` 里既没有 `animations` 也没有 `litepet` 键，所以它那 16 个动画名全是 Codex 行名，提醒也走降级映射。
+
+**动画名跟素材文件名无关。** 外部包的文件名可以跟动画名完全对不上，否则用户没法用自己命名的素材。
 
 ### 9.3 事件 → 动画映射
 
@@ -280,14 +279,14 @@ idle ──agent.start──► working ──agent.end(success)──► celebr
 |---|---|---|
 | `agent/start` | `working` 组默认 | `status`：开始工作 |
 | `tool/start` | 保持当前 | `tool`：`{toolName}` 或宿主给的 `bubble` 文本 |
-| `tool/end`(isError) | `feedback`：`stoat_wave_backflip_smoke_fade_exit` | `error`：`{toolName}` |
+| `tool/end`(isError) | `feedback` 组的失败动画 | `error`：`{toolName}` |
 | `tool/end`（成功） | 保持当前 | **不出气泡**（`toolName` 是去重键，不是展示文本） |
-| `agent/end`(success) | `feedback`：`stoat_stand_lift_barbell_one_hand_fast` | `success`：任务完成 |
-| `agent/end`(fail) | `feedback`：`stoat_wave_backflip_smoke_fade_exit` | `info`：任务失败 |
+| `agent/end`(success) | `feedback` 组的成功动画 | `success`：任务完成 |
+| `agent/end`(fail) | `feedback` 组的失败动画 | `info`：任务失败 |
 | `agent/settled` | `feedback` 组：上次 `agent/end` 成功则庆祝，失败则给失败脸色 | **不出气泡**（除非规则声明；但默认会出声 + 系统通知，见下） |
 | 90s 无事件 | `resting` 组轮换 | — |
 
-> 上表是**内置包** `pet.json` 里 `litepet.behavior.rules` 的等价描述（规则表契约见 `docs/PET-PACK.md` §4.3）。外部包在自己 manifest 里覆盖；daemon 侧只做**通用规则解释器**，不把这套映射写死在 Rust 代码里。
+> 上表是**默认规则**的等价描述，任何包都能用自己 manifest 里的 `litepet.behavior.rules` 覆盖（规则表契约见 `docs/PET-PACK.md` §4.3）。daemon 侧只做**通用规则解释器**；Rust 里写死的只有 §4.4 那张降级映射表，而且只在包没声明规则表时才用。
 >
 > 纯 Codex 包（无 `litepet` 键）走 `docs/PET-PACK.md` §4.4 的降级映射表。
 
