@@ -23,7 +23,7 @@ pub mod desktop;
 pub mod push;
 pub mod sound;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
@@ -32,7 +32,7 @@ use anyhow::{bail, Result};
 use crate::config::NotifyConfig;
 use desktop::Notifier;
 use push::Pusher;
-use sound::{Sound, Speaker};
+use sound::{Layer, Sound, Speaker};
 
 /// 规则表里 `alert` 字段的内容（`docs/PET-PACK.md` §4.5）。
 ///
@@ -167,7 +167,7 @@ pub struct Channels {
 
 /// 提醒层的执行端。
 ///
-/// 它把「配置」「宠物包位置」「三个通道」卷在一起，对外只暴露两个动作：
+/// 它把「配置」「素材来源」「三个通道」卷在一起，对外只暴露两个动作：
 /// [`Alerter::fire`]（异步，给会话线程用）与 [`Alerter::dispatch`]（同步，给测试用）。
 #[derive(Clone)]
 pub struct Alerter {
@@ -175,16 +175,32 @@ pub struct Alerter {
     config: NotifyConfig,
     /// 宠物包根目录，用于解析 `alert.sound` 里的相对路径。
     pack_root: Option<PathBuf>,
+    /// 应用自带的兜底音效目录。
+    bundled_sounds: Option<PathBuf>,
     /// 三个通道。
     channels: Channels,
 }
 
+/// 构造 [`Alerter`] 需要的素材来源。
+///
+/// 位置参数到第三个就该收手：配置、宠物包、应用资源三样东西一路往下传，
+/// 读的人得回去数顺序。
+pub struct AlertSources {
+    /// 用户配置里的 `notify` 段。
+    pub config: NotifyConfig,
+    /// 宠物包根目录，用于解析 `alert.sound` 里的相对路径。
+    pub pack_root: Option<PathBuf>,
+    /// 应用自带的兜底音效目录；开发模式下拿不到资源目录时是 `None`。
+    pub bundled_sounds: Option<PathBuf>,
+}
+
 impl Alerter {
     /// 构造。
-    pub fn new(config: NotifyConfig, pack_root: Option<PathBuf>, channels: Channels) -> Self {
+    pub fn new(sources: AlertSources, channels: Channels) -> Self {
         Self {
-            config,
-            pack_root,
+            config: sources.config,
+            pack_root: sources.pack_root,
+            bundled_sounds: sources.bundled_sounds,
             channels,
         }
     }
@@ -237,15 +253,80 @@ impl Alerter {
     /// 绝不因此把系统通知和推送一起吞掉。
     fn play_sound(&self, raw: &str) {
         let sound = Sound::parse(raw);
-        let Some(path) = sound::resolve(&sound, self.pack_root.as_deref()) else {
-            log::warn!(
+        match self.resolve_path(&sound) {
+            Some(hit) => self.play_file(&hit.path),
+            None => log::warn!(
                 "找不到音效「{raw}」：{hint}",
                 hint = missing_sound_hint(&sound)
-            );
-            return;
-        };
-        if let Err(error) = self.channels.speaker.play(&path, self.config.sound.volume) {
+            ),
+        }
+    }
+
+    /// 把一条音效写法解析成磁盘上真实的文件；解析规则见 [`sound::resolve`]。
+    fn resolve_path(&self, sound: &Sound) -> Option<sound::Hit> {
+        sound::resolve(
+            sound,
+            &sound::Sources {
+                // 用户自选的那一层只裁决语义槽位（由 `sound::resolve` 决定）。
+                user: Some(&self.config.sound.files),
+                pack_root: self.pack_root.as_deref(),
+                bundled: self.bundled_sounds.as_deref(),
+            },
+        )
+    }
+
+    /// 播一个已经解析好的文件；失败只记日志。
+    fn play_file(&self, path: &Path) {
+        if let Err(error) = self.channels.speaker.play(path, self.config.sound.volume) {
             log::warn!("播放音效 {} 失败：{error:#}", path.display());
+        }
+    }
+}
+
+/// 一次试听的结果。
+///
+/// 与 [`Alerter::dispatch`] 分开放在两个 `impl Alerter` 块里：试听是**设置页专用**
+/// 的一条旁路，不是第四个提醒通道，分开写免得读的人把它当通道数。
+///
+/// 不带 JSON：本模块不认识 HTTP 那层的形状，拼响应是 `main` 的活。
+pub struct Preview {
+    /// 实际解析到的文件；`None` 表示这条写法在当前配置与平台上没有可播的文件。
+    pub path: Option<PathBuf>,
+    /// 命中文件来自哪一层；没有命中就是 `None`。
+    pub layer: Option<Layer>,
+    /// 没命中时给用户的一句建议。
+    pub hint: Option<&'static str>,
+}
+
+impl Alerter {
+    /// 试听一个音效：**只出声**，不发系统通知、也不推送。
+    ///
+    /// 与正式提醒共用同一个解析器（[`sound::resolve`]），但**不看开关**：
+    /// `notify.enabled` 与 `notify.sound.enabled` 都关着也照放。理由是试听的语义是
+    /// 「这个文件能不能响」，而不是「现在会不会响」；把开关叠上去，用户点了没声音
+    /// 就分不出是文件不对还是开关不对。
+    ///
+    /// 返回值里带回命中路径与来路：设置页需要能说出「现在响的是你挑的，还是自带的兜底」。
+    pub fn preview(&self, raw: &str) -> Preview {
+        let sound = Sound::parse(raw);
+        match self.resolve_path(&sound) {
+            Some(hit) => {
+                self.play_file(&hit.path);
+                Preview {
+                    path: Some(hit.path),
+                    layer: Some(hit.layer),
+                    hint: None,
+                }
+            }
+            None => {
+                let hint = missing_sound_hint(&sound);
+                log::warn!("试听「{raw}」找不到文件：{hint}");
+                Preview {
+                    path: None,
+                    layer: None,
+                    hint: Some(hint),
+                }
+            }
         }
     }
 }
@@ -267,6 +348,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use sound::SEMANTIC_DONE;
 
     /// 造一份全开的配置，按需关掉某项。
     fn cfg() -> NotifyConfig {
@@ -417,7 +499,12 @@ mod tests {
             notifier,
             pusher,
         };
-        (recorder, Alerter::new(cfg, pack_root, channels))
+        let sources = AlertSources {
+            config: cfg,
+            pack_root,
+            bundled_sounds: None,
+        };
+        (recorder, Alerter::new(sources, channels))
     }
 
     /// 建一个临时目录，里面放一个真文件当音效。
@@ -431,6 +518,86 @@ mod tests {
 
     fn request(sound: Option<&str>, desktop: bool, push: bool) -> Request {
         Request::new(spec(sound, desktop, push), "LitePet", "pi 干完了")
+    }
+
+    /// 配置里挑的音效要真的被播出来。
+    ///
+    /// 这是「配置 → 播放路径」的接缝：`sound.rs` 的单测盖不到它，
+    /// 而它恰好是“配了却不出声”这类 bug 的所在地。
+    #[test]
+    fn configured_sound_reaches_the_speaker() {
+        let (pack_root, _) = temp_sound_pack("configured");
+        let mine = pack_root.join("mine.wav");
+        std::fs::write(&mine, b"not really audio").expect("写临时文件");
+        let mut config = cfg();
+        config.sound.files.done = mine.display().to_string();
+
+        let (recorder, alerter) = alerter(config, Some(pack_root.clone()));
+        alerter.dispatch(&request(Some("@done"), false, false));
+        let played = recorder.sounds.lock().expect("锁").clone();
+        // 记账的是（路径, 音量）对，这里只关心路径。
+        assert_eq!(played.len(), 1, "应该只响一声：{played:?}");
+        assert_eq!(played[0].0, mine);
+        std::fs::remove_dir_all(&pack_root).ok();
+    }
+
+    /// 试听只出声：不发系统通知、也不推送，并且如实报出命中的来路。
+    #[test]
+    fn preview_only_plays_the_sound() {
+        let (recorder, alerter) = alerter(cfg(), None);
+        let preview = alerter.preview(SEMANTIC_DONE);
+        assert!(
+            recorder.desktop.lock().expect("锁").is_empty(),
+            "试听不该发系统通知"
+        );
+        assert!(
+            recorder.push.lock().expect("锁").is_empty(),
+            "试听不该推手机"
+        );
+        match preview.path {
+            Some(path) => {
+                let played = recorder.sounds.lock().expect("锁").clone();
+                assert_eq!(played.len(), 1, "命中了就该响一声");
+                assert_eq!(played[0].0, path);
+                assert!(preview.layer.is_some(), "命中了就必须报来路");
+                assert!(preview.hint.is_none(), "命中了就不该给建议");
+            }
+            None => {
+                // 平台上根本没有对应音效也算正常，但那就什么都别放。
+                assert!(preview.layer.is_none());
+                assert!(preview.hint.is_some(), "没命中必须给一条能照着做的建议");
+                assert!(recorder.sounds.lock().expect("锁").is_empty());
+            }
+        }
+    }
+
+    /// 试听不看开关：总开关与音效开关都关着，试听也要出声。
+    ///
+    /// 这是刻意的：试听回答的是「这个文件能不能响」。要是也看开关，用户点了没声音
+    /// 就分不出是文件不对、还是开关不对。（正式提醒仍然会老老实实看开关。）
+    #[test]
+    fn preview_ignores_the_switches() {
+        let (pack_root, file) = temp_sound_pack("preview-switches");
+        let mut config = cfg();
+        config.enabled = false;
+        config.sound.enabled = false;
+        config.sound.files.done = file.display().to_string();
+
+        let (recorder, alerter) = alerter(config, Some(pack_root.clone()));
+        let preview = alerter.preview(SEMANTIC_DONE);
+        assert_eq!(preview.path.as_deref(), Some(file.as_path()));
+        assert_eq!(preview.layer, Some(Layer::User));
+        assert_eq!(
+            recorder.sounds.lock().expect("锁").len(),
+            1,
+            "开关关着也要出声：试听不看开关"
+        );
+
+        // 同一份配置走正式提醒就不出声了——上面那条断言才有意义。
+        let actions = alerter.dispatch(&request(Some("@done"), false, false));
+        assert!(actions.sound.is_none(), "正式提醒应被总开关拦下");
+        assert_eq!(recorder.sounds.lock().expect("锁").len(), 1);
+        std::fs::remove_dir_all(&pack_root).ok();
     }
 
     /// 只给声音的规格不该顺手把通知与推送也发出去。

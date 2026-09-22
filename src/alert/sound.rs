@@ -5,9 +5,10 @@
 //! 1. **cpal 的输出流不是 `Send`，而且一 drop 就断音。** 所以它不能躺在
 //!    某个随时可能被移动或丢弃的句柄里，必须待在一个专用线程上。顺带的好处是
 //!    「打开音频设备」被推到了第一次真要出声的时刻，而不是每次启动都敲一次 CoreAudio。
-//! 2. **系统音效的名字不跨平台。** macOS 是 `Glass`，Windows 是 `Windows Notify`，
-//!    Linux 是 `bell`。所以除了「原样写名字」之外，还认 `@done` 这类语义名，
-//!    由本模块映射到当前平台。想要听感完全一致，就把音效文件放进包里用相对路径引用。
+//! 2. **系统音效的名字不跨平台。** macOS 是 `Glass`，Windows 是 `Media\Windows Notify.wav`，
+//!    Linux 是 `bell`，而 Windows 那份甚至对不上我们写的候选名。所以除了「原样写名字」
+//!    之外，还认 `@done` 这类语义名；语义名走**用户自选 → 应用自带兜底 → 系统音效**
+//!    这条链（见 [`resolve`]），前两层是文件、随安装包走，所以两个平台上听感一致。
 //! 3. **裸名字先当包内文件。** `"sound": "done.wav"` 是包作者最自然的写法，
 //!    所以不含 `/` 的名字先到宠物包里找，找不到再当系统音效名——顺序见 [`resolve`]。
 
@@ -19,6 +20,8 @@ use std::thread;
 use anyhow::{anyhow, Result};
 use rodio::stream::DeviceSinkBuilder;
 use rodio::{MixerDeviceSink, Player};
+
+use crate::config::SoundFiles;
 
 /// 语义音效名的前缀。
 const SEMANTIC_PREFIX: char = '@';
@@ -67,25 +70,129 @@ impl Sound {
     }
 }
 
+/// 解析音效时需要的三处素材来源。
+///
+/// 打包成一个结构体而不是逐个往下传，理由和 `http::Shared` 一样：要过配置、宠物包、
+/// 应用资源三样东西，位置参数一多，读的人就得回去数顺序。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Sources<'a> {
+    /// 用户配置的三个语义音效（`config.json` 的 `notify.sound.files`）。
+    pub user: Option<&'a SoundFiles>,
+    /// 宠物包根目录，解析包内相对路径用。
+    pub pack_root: Option<&'a Path>,
+    /// 应用自带的兜底音效目录（打包后是 `resource_dir` 下的 `sounds/`）。
+    pub bundled: Option<&'a Path>,
+}
+
+/// 音效素材的来路。
+///
+/// 单独记下来是因为「哪个文件会被播」在界面上完全看不见：用户挑了一个文件、
+/// 听到声音，但实际响的可能是自带的兜底——不说清楚就会变成下次续查的谜。
+/// 这几个字符串会出在 `notify/preview` 的响应里（`docs/PROTOCOL.md`），
+/// 改写法就等于改协议。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    /// 用户自己在设置页挑的文件。
+    User,
+    /// 应用自带的兜底音效。
+    Bundled,
+    /// 宠物包里的文件。
+    Pack,
+    /// 当前平台的系统音效。
+    System,
+}
+
+impl Layer {
+    /// 协议里的名字。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Layer::User => "user",
+            Layer::Bundled => "bundled",
+            Layer::Pack => "pack",
+            Layer::System => "system",
+        }
+    }
+}
+
+/// 命中的文件，以及它来自哪一层。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    /// 磁盘上真实存在的文件。
+    pub path: PathBuf,
+    /// 它是哪一层给的。
+    pub layer: Layer,
+}
+
+impl Hit {
+    /// 给一个解析结果打上「来自哪一层」的标签。
+    fn at(layer: Layer, path: Option<PathBuf>) -> Option<Self> {
+        path.map(|path| Self { path, layer })
+    }
+}
+
 /// 把音效解析成磁盘上真实存在的文件；找不到返回 `None`。
 ///
 /// 找不到**不是错误**：用户从别的平台搬一个包过来、或者系统没装某个音效，
 /// 都是很常见的事。调用方记一条带建议的日志然后跳过就好。
 ///
-/// 裸名字有两种合法解释，按**包内优先**的顺序试：
+/// 三条路径，按写法分流：
 ///
-/// 1. 宠物包里的同名文件——`"sound": "done.wav"` 是包作者最自然的写法；
-/// 2. 当前平台的系统音效——`"sound": "Glass"`。
+/// 1. **含 `/` 的包内相对路径**——照直在宠物包里找（`"sounds/done.wav"`）。
+/// 2. **`@` 开头的语义名**——依次试：用户自选的文件 → 应用自带的兜底音效 →
+///    当前平台的系统音效。前两层是**文件**、随安装包走，所以两个平台上听感一致；
+///    系统音效那层只做保命（开发模式没有资源目录时仍然能响）。
+/// 3. **裸名字**——先当宠物包里的同名文件（`"sound": "done.wav"` 是包作者最自然的
+///    写法），再当当前平台的系统音效名（`"sound": "Glass"`）。
 ///
-/// 顺序不能反过来。反了之后 `"done.wav"` 会被当成一个叫 `done.wav` 的系统音效，
-/// 解析不到、静默失声，而它在配置里看起来完全没错。
-/// `@` 开头的语义名只走系统音效，不去包里撞运气。
-pub fn resolve(sound: &Sound, pack_root: Option<&Path>) -> Option<PathBuf> {
+/// 第 3 条的顺序不能反过来。反了之后 `"done.wav"` 会被当成一个叫 `done.wav`
+/// 的系统音效，解析不到、静默失声，而它在配置里看起来完全没错。
+pub fn resolve(sound: &Sound, sources: &Sources<'_>) -> Option<Hit> {
     match sound {
-        Sound::Pack(relative) => pack_file(pack_root, relative),
-        Sound::System(name) if name.starts_with(SEMANTIC_PREFIX) => system_sound(name),
-        Sound::System(name) => pack_file(pack_root, name).or_else(|| system_sound(name)),
+        Sound::Pack(relative) => Hit::at(Layer::Pack, pack_file(sources.pack_root, relative)),
+        Sound::System(name) if name.starts_with(SEMANTIC_PREFIX) => {
+            semantic_file(name, sources).or_else(|| Hit::at(Layer::System, system_sound(name)))
+        }
+        Sound::System(name) => Hit::at(Layer::Pack, pack_file(sources.pack_root, name))
+            .or_else(|| Hit::at(Layer::System, system_sound(name))),
     }
+}
+
+/// 语义名的前两层：用户自选的文件，然后是应用自带的兜底。
+///
+/// **语义名不进宠物包**：包里那个叫 `@done` 的文件只会是误会，而包作者要指定
+/// 某个文件时有路径写法（第 1 条）。这也意味着用户配置只裁决语义槽位，
+/// 不会去劫持包作者点名的具体文件（见 `user_choice_does_not_hijack_an_explicit_pack_path`）。
+fn semantic_file(name: &str, sources: &Sources<'_>) -> Option<Hit> {
+    Hit::at(Layer::User, user_file(sources.user, name))
+        .or_else(|| Hit::at(Layer::Bundled, bundled_file(sources.bundled, name)))
+}
+
+/// 用户为某个语义名挑的文件。
+///
+/// 没配、或者配的那个文件已经不在了，都算 `None`——**不报错**。同一份
+/// `config.json` 会在两台机器上被读到，另一台机器配的路径在这台必然不存在，
+/// 那时正确答案是「按没配处理」，而不是「不出声」。
+fn user_file(user: Option<&SoundFiles>, name: &str) -> Option<PathBuf> {
+    let chosen = match name {
+        SEMANTIC_DONE => &user?.done,
+        SEMANTIC_FAILED => &user?.failed,
+        SEMANTIC_ATTENTION => &user?.attention,
+        _ => return None,
+    };
+    let path = PathBuf::from(chosen.trim());
+    path.is_file().then_some(path)
+}
+
+/// 应用自带的兜底音效：文件名就是语义名本身（`sounds/@done.wav`）。
+///
+/// 这一层是「Windows 上不再是个哑巴」的保证：它随安装包走，不依赖系统装了什么、
+/// 也不依赖宠物包作者有没有带音效。
+fn bundled_file(bundled: Option<&Path>, name: &str) -> Option<PathBuf> {
+    let dir = bundled?;
+    SOUND_EXTENSIONS
+        .iter()
+        .map(|ext| dir.join(format!("{name}.{ext}")))
+        .find(|path| path.is_file())
 }
 
 /// 在宠物包根下找一个相对路径，要求它真实存在。
@@ -273,6 +380,20 @@ fn play_once(sink: &MixerDeviceSink, command: &Command) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// 只关心宠物包那一层的用例走这个，省得每处都搭一个 [`Sources`]。
+    ///
+    /// 丢掉 [`Hit`] 的来路：来路由 `each_layer_is_reported_in_order` 专门钉住。
+    fn resolve_in_pack(sound: &Sound, pack_root: Option<&Path>) -> Option<PathBuf> {
+        resolve(
+            sound,
+            &Sources {
+                pack_root,
+                ..Sources::default()
+            },
+        )
+        .map(|hit| hit.path)
+    }
+
     #[test]
     fn slash_means_pack_file() {
         assert_eq!(
@@ -294,8 +415,8 @@ mod tests {
     #[test]
     fn pack_sound_requires_a_root() {
         let sound = Sound::parse("sounds/done.wav");
-        assert_eq!(resolve(&sound, None), None);
-        assert_eq!(resolve(&sound, Some(Path::new("/nowhere"))), None);
+        assert_eq!(resolve_in_pack(&sound, None), None);
+        assert_eq!(resolve_in_pack(&sound, Some(Path::new("/nowhere"))), None);
     }
 
     #[test]
@@ -306,10 +427,10 @@ mod tests {
         std::fs::write(&file, b"not really audio").expect("写临时文件");
 
         let sound = Sound::parse("done.wav");
-        assert_eq!(resolve(&sound, Some(&dir)), Some(file));
+        assert_eq!(resolve_in_pack(&sound, Some(&dir)), Some(file));
 
         let missing = Sound::parse("nope.wav");
-        assert_eq!(resolve(&missing, Some(&dir)), None);
+        assert_eq!(resolve_in_pack(&missing, Some(&dir)), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -330,7 +451,16 @@ mod tests {
             Sound::System("done.wav".to_string()),
             "裸名字归到 System"
         );
-        assert_eq!(resolve(&sound, Some(&dir)), Some(file));
+        let hit = resolve(
+            &sound,
+            &Sources {
+                pack_root: Some(&dir),
+                ..Sources::default()
+            },
+        )
+        .expect("应命中包内文件");
+        assert_eq!(hit.layer, Layer::Pack, "包作者点名的文件应报 pack");
+        assert_eq!(hit.path, file);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -340,8 +470,8 @@ mod tests {
     fn bare_name_falls_back_to_the_system_sound() {
         let dir = std::env::temp_dir().join("litepet-sound-fallback");
         std::fs::create_dir_all(&dir).expect("建临时目录");
-        let resolved =
-            resolve(&Sound::System("Glass".to_string()), Some(&dir)).expect("应退回系统音效");
+        let resolved = resolve_in_pack(&Sound::System("Glass".to_string()), Some(&dir))
+            .expect("应退回系统音效");
         // 不写死扩展名：用户自己的 `~/Library/Sounds` 能覆盖系统默认。
         assert_eq!(
             resolved.file_stem().and_then(|stem| stem.to_str()),
@@ -360,12 +490,201 @@ mod tests {
         // 放一个同名陷阱。如果解析顺序错了，它会被命中。
         std::fs::write(dir.join(SEMANTIC_DONE), b"trap").expect("写陷阱文件");
 
-        let resolved = resolve(&Sound::parse(SEMANTIC_DONE), Some(&dir)).expect("应解析到系统音效");
+        let resolved =
+            resolve_in_pack(&Sound::parse(SEMANTIC_DONE), Some(&dir)).expect("应解析到系统音效");
         assert!(
             !resolved.starts_with(&dir),
             "语义名不该命中包里的同名陷阱：{resolved:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 一套临时素材：用户挑的、应用兜底的、宠物包里放的同名陷阱。
+    ///
+    /// 三处都建出来，是为了让每个用例都能断言**到底命中了哪一层**——
+    /// 只断言「解析成功」是分不出层的。
+    struct Fixture {
+        base: PathBuf,
+        user: PathBuf,
+        bundled: PathBuf,
+        pack: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            let base = std::env::temp_dir().join(format!("litepet-sound-{tag}"));
+            let user = base.join("user");
+            let bundled = base.join("bundled");
+            let pack = base.join("pack");
+            for dir in [&user, &bundled, &pack] {
+                std::fs::create_dir_all(dir).expect("建临时目录");
+            }
+            // 用户那份和兜底那份的名字故意不同，好分辨命中了哪层。
+            std::fs::write(user.join("mine.wav"), b"user").expect("写用户音效");
+            std::fs::write(bundled.join(format!("{SEMANTIC_DONE}.wav")), b"bundled")
+                .expect("写兜底音效");
+            Self {
+                base,
+                user,
+                bundled,
+                pack,
+            }
+        }
+
+        /// 用户配置里三个语义槽位都指向自己那个文件。
+        fn files(&self) -> SoundFiles {
+            let mine = self.user.join("mine.wav").display().to_string();
+            SoundFiles {
+                done: mine.clone(),
+                failed: mine.clone(),
+                attention: mine,
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.base).ok();
+        }
+    }
+
+    /// 用户自己挑的音效优先于应用自带的兜底——这是「我想听哪个」的最终裁决。
+    #[test]
+    fn user_choice_wins_over_the_bundled_sound() {
+        let fx = Fixture::new("user-wins");
+        let user = fx.files();
+        let resolved = resolve(
+            &Sound::parse(SEMANTIC_DONE),
+            &Sources {
+                user: Some(&user),
+                pack_root: Some(&fx.pack),
+                bundled: Some(&fx.bundled),
+            },
+        );
+        assert_eq!(resolved.map(|hit| hit.path), Some(fx.user.join("mine.wav")));
+    }
+
+    /// 用户挑的音效对**包作者点名的具体文件**不生效。
+    ///
+    /// `sounds/special.wav` 是明确指定，让一个全局配置去覆盖它只会让包失去表达能力。
+    #[test]
+    fn user_choice_does_not_hijack_an_explicit_pack_path() {
+        let fx = Fixture::new("explicit-path");
+        let user = fx.files();
+        std::fs::create_dir_all(fx.pack.join("sounds")).expect("建包内 sounds/");
+        std::fs::write(fx.pack.join("sounds/special.wav"), b"pack").expect("写包内音效");
+        let resolved = resolve(
+            &Sound::parse("sounds/special.wav"),
+            &Sources {
+                user: Some(&user),
+                pack_root: Some(&fx.pack),
+                bundled: Some(&fx.bundled),
+            },
+        );
+        assert_eq!(
+            resolved.map(|hit| hit.path),
+            Some(fx.pack.join("sounds/special.wav"))
+        );
+    }
+
+    /// 同一份 `config.json` 会在两台机器上被读到，另一台机器配的路径在这台必然不存在。
+    /// 那时要**按没配处理**往下走，而不是「路径不对所以不出声」。
+    #[test]
+    fn a_missing_user_choice_falls_through_to_the_bundled_sound() {
+        let fx = Fixture::new("user-missing");
+        let user = SoundFiles {
+            done: fx.user.join("gone.wav").display().to_string(),
+            ..SoundFiles::default()
+        };
+        let resolved = resolve(
+            &Sound::parse(SEMANTIC_DONE),
+            &Sources {
+                user: Some(&user),
+                bundled: Some(&fx.bundled),
+                ..Sources::default()
+            },
+        );
+        assert_eq!(
+            resolved.map(|hit| hit.path),
+            Some(fx.bundled.join(format!("{SEMANTIC_DONE}.wav")))
+        );
+    }
+
+    /// 「Windows 上不再是个哑巴」靠的就是兜底这一层：系统里没有 `Glass`、`Basso`
+    /// 那种名字，兜底音效却随安装包一起走。
+    ///
+    /// 这个用例不依赖任何系统音效，因此在三个平台上都能跑。
+    #[test]
+    fn bundled_sound_keeps_all_three_semantics_alive() {
+        let fx = Fixture::new("bundled-three");
+        // 文件名就是语义名本身（`@failed.wav`），和仓库的 `assets/sounds` 一致。
+        // 写成 `failed.wav` 就永远命不中——这正是这条用例存在的理由。
+        for semantic in [SEMANTIC_FAILED, SEMANTIC_ATTENTION] {
+            std::fs::write(fx.bundled.join(format!("{semantic}.wav")), b"bundled")
+                .expect("写兜底音效");
+        }
+        // 只给兜底目录：用户没配、也没有宠物包。
+        let sources = Sources {
+            bundled: Some(&fx.bundled),
+            ..Sources::default()
+        };
+        for semantic in [SEMANTIC_DONE, SEMANTIC_FAILED, SEMANTIC_ATTENTION] {
+            let hit = resolve(&Sound::parse(semantic), &sources)
+                .unwrap_or_else(|| panic!("{semantic} 应命中自带的兜底音效"));
+            assert!(
+                hit.path.starts_with(&fx.bundled),
+                "{semantic} 命中了兜底目录以外的文件：{:?}",
+                hit.path
+            );
+            assert_eq!(hit.layer, Layer::Bundled, "{semantic} 的来路应是 bundled");
+        }
+    }
+
+    /// 同一层优先顺序：[`Layer`] 要如实报告「现在响的到底是谁」。
+    ///
+    /// 设置页靠它回答「我挑的那个生效了吗」——只听声音是分不出来的，
+    /// 自带的兜底与用户挑的文件听起来一样。
+    #[test]
+    fn each_layer_is_reported_in_order() {
+        let fx = Fixture::new("layers");
+        let user = fx.files();
+        let sources = Sources {
+            user: Some(&user),
+            pack_root: Some(&fx.pack),
+            bundled: Some(&fx.bundled),
+        };
+        let hit = resolve(&Sound::parse(SEMANTIC_DONE), &sources).expect("用户挑的那个");
+        assert_eq!(hit.layer, Layer::User);
+        assert_eq!(hit.path, fx.user.join("mine.wav"));
+
+        // 把用户槽位清掉：掉到自带兜底。
+        let empty = SoundFiles::default();
+        let hit = resolve(
+            &Sound::parse(SEMANTIC_DONE),
+            &Sources {
+                user: Some(&empty),
+                ..sources
+            },
+        )
+        .expect("自带兜底");
+        assert_eq!(hit.layer, Layer::Bundled);
+    }
+
+    /// 前两层都没有时掉到系统音效，并且如实报告。
+    ///
+    /// 只在 macOS 上有保证（Linux 得装上声音主题、Windows 的名字对不上）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_layer_is_reported() {
+        let hit = resolve(
+            &Sound::parse(SEMANTIC_DONE),
+            &Sources {
+                user: Some(&SoundFiles::default()),
+                ..Sources::default()
+            },
+        )
+        .expect("macOS 上应能解析出系统音效");
+        assert_eq!(hit.layer, Layer::System);
     }
 
     #[test]

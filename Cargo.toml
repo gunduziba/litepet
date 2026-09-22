@@ -29,6 +29,10 @@ rodio = { version = "0.22", default-features = false, features = [
     "symphonia-aiff",
 ] }
 tauri-plugin-notification = "2"
+# 设置页的「选择音效文件」。用系统原生对话框而不是 webview 的 <input type=file>：
+# 后者拿到的是一个内存里的 blob，拿不到真实路径，而配置里存的必须是路径
+# （daemon 是无窗口的那一侧，重启后还得能自己找到这个文件）。
+tauri-plugin-dialog = "2"
 # 手机推送：阻塞式，不引入 async 运行时；默认特性已含 rustls。
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 

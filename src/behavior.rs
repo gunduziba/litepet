@@ -15,6 +15,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::alert::sound::{SEMANTIC_DONE, SEMANTIC_FAILED};
 use crate::alert::AlertSpec;
 use crate::protocol::BubbleKind;
 
@@ -97,16 +98,22 @@ fn fallback_spec(sound: &str) -> AlertSpec {
 /// 规则表本就是可选的，但「整轮干完了」这类语义是跳包通用的。少了这几条，
 /// 提醒链路对纯 Codex 包就是死的——用户会以为功能坏了，而不是以为“这个包没声”。
 ///
-/// 音效名字用了 macOS 的系统音效名；其他平台按名字回退，见 [`crate::alert::sound`]。
+/// 音效用**语义名**而不是某个平台的具体名字。
+///
+/// 这一条不是风格问题：写 `"Glass"` 只有 macOS 认得，而解析链里
+/// 「应用自带兑底」那一层是按语义名存的（`assets/sounds/@done.wav`），
+/// 于是 Windows 上纯 Codex 包的整轮结束提醒会完全静音——
+/// 而“没声音”也恰好是用户提单时报的那个问题。
+/// 语义名的解析顺序见 [`crate::alert::sound::resolve`]。
 fn fallback_alert(event: &Event<'_>) -> Option<AlertSpec> {
     match event.kind {
         // 整轮结束且不会自动继续：用户最需要被告知的一件事。
-        event_names::AGENT_SETTLED => Some(fallback_spec("Glass")),
+        event_names::AGENT_SETTLED => Some(fallback_spec(SEMANTIC_DONE)),
         // 一轮以失败告终。成功不提醒：屏幕上本来就在动，再响会很快变噪声。
         event_names::AGENT_END
             if event.fields.get("success").and_then(Value::as_bool) == Some(false) =>
         {
-            Some(fallback_spec("Basso"))
+            Some(fallback_spec(SEMANTIC_FAILED))
         }
         _ => None,
     }
@@ -549,6 +556,38 @@ mod tests {
             behavior.play_for(Stage::Failure, &known),
             Some(Play::Animation("sad".to_string()))
         );
+    }
+
+    /// 纯 Codex 包的默认提醒必须用**语义名**，不能写平台的具体音效名。
+    ///
+    /// 这条是用例而不是注释就能说清的：解析链里「应用自带兑底」那一层是按
+    /// 语义名存的（`assets/sounds/@done.wav`），写成 `"Glass"` 就绕过了它，
+    /// 于是 Windows 上整轮结束会完全静音——用户报的“没声音”正是这个。
+    #[test]
+    fn fallback_alert_uses_semantic_names() {
+        let behavior = Behavior::new(None, &known()).expect("应降级成功");
+        let settled = behavior.resolve(&Event::new("agent.settled", json!({})));
+        assert_eq!(
+            settled.alert.and_then(|spec| spec.sound).as_deref(),
+            Some("@done"),
+            "整轮结束应走 @done（用户自选 → 自带兑底 → 系统）"
+        );
+        let failed = behavior.resolve(&Event::new("agent.end", json!({ "success": false })));
+        assert_eq!(
+            failed.alert.and_then(|spec| spec.sound).as_deref(),
+            Some("@failed"),
+        );
+        // 成功不提醒：屏幕上本来就在动。
+        let ok = behavior.resolve(&Event::new("agent.end", json!({ "success": true })));
+        assert!(ok.alert.is_none());
+    }
+
+    /// 有规则表的包以规则表为准：默认提醒不该插进去。
+    #[test]
+    fn rules_pack_does_not_get_the_codex_alert() {
+        let behavior = rules_behavior();
+        let settled = behavior.resolve(&Event::new("agent.settled", json!({})));
+        assert!(settled.alert.is_none(), "规则表未命中时不该拿默认提醒填坑");
     }
 
     #[test]

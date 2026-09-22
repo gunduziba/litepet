@@ -30,7 +30,11 @@ const PET_LIST = ${JSON.stringify(PET_LIST)};
 const respond = ${respond.toString()};
 window.__TAURI__ = {
   core: {
-    invoke: async (command, a) => respond(a.method, a.params),
+    invoke: async (command, a) => {
+      // 文件对话框在无头预览里开不了，用一个固定路径代替用户挑中的那个。
+      if (command === 'choose_sound_file') return '/tmp/picked-by-dialog.wav';
+      return respond(a.method, a.params);
+    },
     // 让缩略图真的加载出来：Chrome 用 file:// 打开本地图集。
     convertFileSrc: (path) => 'file://' + path,
   },
@@ -58,6 +62,21 @@ window.__probe = () => {
     statusError: document.getElementById('status').dataset.error ?? null,
     petRows: document.querySelectorAll('#pets li').length,
     pathRows: document.querySelectorAll('#paths dt').length,
+    // 音效那一行：标识 + 输入框 + 两个按钮（选择、试听）。
+    // 窗口只有 720px 宽，按钮被挤出去或输入框被挤没是这里最可能的坏法。
+    soundRow: (() => {
+      const input = document.getElementById('sound-done');
+      const row = input.parentElement;
+      const box = row.getBoundingClientRect();
+      // 两个按钮都在行内、且没被挤出右边界：窗口只有 720px 宽，
+      // 按钮被挤出去或输入框被挤没是这里最可能的坏法。
+      const buttons = [...row.querySelectorAll('button')];
+      return {
+        buttons: buttons.length,
+        pushesOut: buttons.some((b) => b.getBoundingClientRect().right > box.right + 1),
+        inputWidth: input.clientWidth,
+      };
+    })(),
   });
   document.body.appendChild(pre);
 };
@@ -114,6 +133,14 @@ expect(probeData.hint?.color, 'rgb(154, 154, 166)', '说明文字颜色');
 expect(probeData.statusError, null, '状态条不该有错误');
 expect(probeData.petRows, 2, '宠物条目数');
 expect(probeData.pathRows, 5, '路径条目数');
+// 音效行不能被挤坏：两个按钮都在，输入框留得下一条路径。
+expect(probeData.soundRow?.buttons, 2, '音效行里的按钮数（选择/试听）');
+if (!(probeData.soundRow?.inputWidth >= 120)) {
+  failures.push(`音效输入框只剩 ${probeData.soundRow?.inputWidth}px，放不下一条路径`);
+}
+if (!(probeData.soundRow?.pushesOut !== true)) {
+  failures.push('音效行右侧的按钮被挤出了容器');
+}
 
 console.log(`已截图：${png}`);
 console.log(JSON.stringify(probeData, null, 2));

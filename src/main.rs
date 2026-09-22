@@ -40,11 +40,12 @@ use std::time::Duration;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, WindowEvent};
+use tauri_plugin_dialog::DialogExt;
 
 use alert::desktop::TauriNotifier;
 use alert::push::{BarkPusher, Pusher, SilentPusher};
-use alert::sound::RodioSpeaker;
-use alert::{AlertSpec, Alerter, Channels, Request};
+use alert::sound::{Layer, RodioSpeaker};
+use alert::{AlertSources, AlertSpec, Alerter, Channels, Request};
 use config::NotifyConfig;
 use jsonrpc::ErrorObject;
 use presence::Presence;
@@ -75,7 +76,7 @@ struct DaemonHandle(Arc<DaemonState>);
 /// 而 token 是给**外部进程**用的凭证。绕开它这里走同一条出口，
 /// 于是「哪些方法属于哪一层」只有一处定义。
 ///
-/// 刻意只放行 daemon 层（`pet/*`、`config/*`、`notify/test`）：`host/*` 与 `agent/*`
+/// 刻意只放行 daemon 层（`pet/*`、`config/*`、`notify/*`）：`host/*` 与 `agent/*`
 /// 是外部进程驱动宠物的入口，从窗口里把它们敞开等于把鉴权作废。
 #[tauri::command]
 fn local_call(
@@ -88,6 +89,29 @@ fn local_call(
         Some(Err(err)) => Err(err.message),
         None => Err(format!("{method} 不是设置页可以调用的方法")),
     }
+}
+
+/// 打开系统文件选择框挑一个音效文件，返回绝对路径；用户取消返回 `None`。
+///
+/// 刻意**不按扩展名过滤**：能放不能放取决于容器而不是后缀——`.wav` 后缀的文件
+/// 也可能是别的东西，而没见过的后缀（其实能放）会被筛掉。选错的文件在
+/// 「试听」时会当场说话，那比一个猜出来的白名单可靠。
+///
+/// 写成 `async` 命令是有原因的：`blocking_pick_file` 会阻塞到用户点完为止，
+/// 而在同步命令里写它就是在主线程上等——主线程还得负责画窗口。
+#[tauri::command]
+async fn choose_sound_file(app: tauri::AppHandle) -> Option<String> {
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("挑一个音效文件")
+        .blocking_pick_file();
+    // 取值可能是路径也可能是 URL（`file://` 那种）。配置里只能放路径，
+    // 所以只取能还原成路径的：拿不到就当用户没选——存一个坏路径只会在
+    // 下次启动时安静地变成“没声音”。
+    picked
+        .and_then(|path| path.into_path().ok())
+        .map(|path| path.to_string_lossy().into_owned())
 }
 
 /// 渲染层启动时拉取宠物包信息。
@@ -125,6 +149,13 @@ fn renderer_applied(animation: String, bubble: Option<String>) {
 /// `Contents/Resources/pets`，所以这里只写叶子名。资源是**散文件**而不是嵌进
 /// 二进制：图集只有换包时才变，没必要每次升级都重新分发一份（`docs/PET-PACK.md` §7.3）。
 const BUNDLED_PETS: &str = "pets";
+
+/// App 包里自带声音资源的目录名。
+///
+/// 同 `BUNDLED_PETS`，靠 `bundle.resources` 把仓库的 `assets/sounds` 铺到
+/// `Contents/Resources/sounds`。这一份是**兜底**：Windows 上没有 `Glass`
+/// 那类系统音效，只有随包走的文件能把三个语义撑住。
+const BUNDLED_SOUNDS: &str = "sounds";
 
 /// 首次初始化家目录时，把 App 自带的宠物铺进 `~/.litepet/pets/`。
 ///
@@ -211,9 +242,9 @@ fn pick_pack(root: &Path, preferred: Option<&str>) -> Option<String> {
 }
 
 /// 读取配置并加载宠物包，顺带把本次启动要用的端口带出来。
-fn try_init_pet(app: &tauri::AppHandle) -> Result<(pack::LoadedPet, u16)> {
-    let (cfg, created) = config::load_or_init()?;
-    if created {
+fn try_init_pet(app: &tauri::AppHandle, first_run: bool) -> Result<(pack::LoadedPet, u16)> {
+    let (cfg, _) = config::load_or_init()?;
+    if first_run {
         log::info!("已初始化家目录 {}", config::home_dir()?.display());
         // 必须在 `pick_pack` 之前：首次启动时 `pets/` 是空的，先铺才有得挑。
         seed_default_pets(app);
@@ -248,8 +279,8 @@ fn try_init_pet(app: &tauri::AppHandle) -> Result<(pack::LoadedPet, u16)> {
 ///
 /// 返回的端口在加载失败时没有意义（此时也不会有 HTTP 服务），
 /// 用默认值填上只是让调用方不必处理 `Option`。
-fn init_pet(app: &tauri::AppHandle) -> (PetState, u16) {
-    match try_init_pet(app) {
+fn init_pet(app: &tauri::AppHandle, first_run: bool) -> (PetState, u16) {
+    match try_init_pet(app, first_run) {
         Ok((loaded, port)) => (PetState(Arc::new(Mutex::new(Some(Arc::new(loaded))))), port),
         Err(err) => {
             log::error!("宠物包加载失败：{err:#}");
@@ -426,6 +457,17 @@ impl DaemonState {
     fn apply_window(&self, cfg: &config::Config) {
         // 不动位置：改尺寸时顺手把窗口挪走很难受。
         apply_window_config(&self.app, cfg, false);
+    }
+
+    /// 取一份当前的提醒执行端。
+    ///
+    /// 配置或宠物包一变就整个换掉（`reload_alerts`），所以每次用之前都要重新取，
+    /// 不能把 `Alerter` 存成字段——那就变成两个真源了。
+    fn alerter(&self) -> std::result::Result<Arc<Alerter>, ErrorObject> {
+        self.alerts
+            .lock()
+            .map(|slot| Arc::clone(&slot))
+            .map_err(|_| ErrorObject::new(jsonrpc::INTERNAL_ERROR, "提醒槽已损坏"))
     }
 }
 
@@ -623,11 +665,7 @@ impl http::Daemon for DaemonState {
     }
 
     fn notify_test(&self) -> std::result::Result<Value, ErrorObject> {
-        let alerter = self
-            .alerts
-            .lock()
-            .map(|slot| Arc::clone(&slot))
-            .map_err(|_| ErrorObject::new(jsonrpc::INTERNAL_ERROR, "提醒槽已损坏"))?;
+        let alerter = self.alerter()?;
         // 走的就是真实提醒那条路（同一个 `dispatch`）。另起一条测试专用路径
         // 只会验证出一条真实事件走不到的路。
         let actions = alerter.dispatch(&test_request());
@@ -635,6 +673,22 @@ impl http::Daemon for DaemonState {
             "sound": actions.sound,
             "desktop": actions.desktop,
             "push": actions.push,
+        }))
+    }
+
+    fn notify_preview(&self, sound: &str) -> std::result::Result<Value, ErrorObject> {
+        let alerter = self.alerter()?;
+        // 试听不走 `dispatch`：它不看任何开关，只回答「这个文件能不能响」。
+        let preview = alerter.preview(sound);
+        Ok(json!({
+            "sound": sound,
+            // 非 UTF-8 路径强行转字符串而不是 `json!` 直接序列化：后者会 panic，
+            // 而一个名字古怪的音效文件不该把整个进程带走。
+            "path": preview
+                .path
+                .map(|path| path.to_string_lossy().into_owned()),
+            "layer": preview.layer.map(Layer::as_str),
+            "hint": preview.hint,
         }))
     }
 }
@@ -847,6 +901,14 @@ fn build_alerter(app: tauri::AppHandle, pack_root: PathBuf) -> Arc<Alerter> {
             log::warn!("读取提醒配置失败，按默认值处理：{err:#}");
             NotifyConfig::default()
         });
+    let bundled_sounds = match app.path().resource_dir() {
+        Ok(dir) => Some(dir.join(BUNDLED_SOUNDS)),
+        Err(err) => {
+            // 与自带宠物一样：没资源目录就当没有兜底，不影响其他两个通道。
+            log::warn!("取不到资源目录，自带的音效兜底不可用：{err}");
+            None
+        }
+    };
     if !notify.enabled {
         log::info!("提醒总开关是关的（config.json 的 notify.enabled）");
     }
@@ -858,9 +920,14 @@ fn build_alerter(app: tauri::AppHandle, pack_root: PathBuf) -> Arc<Alerter> {
             Arc::new(SilentPusher)
         }
     };
+    // 放在最后拼：`notify` 在这里被移进 `sources`，前面还要借它的 `push` 段。
+    let sources = AlertSources {
+        config: notify,
+        pack_root: Some(pack_root),
+        bundled_sounds,
+    };
     Arc::new(Alerter::new(
-        notify,
-        Some(pack_root),
+        sources,
         Channels {
             speaker: Arc::new(RodioSpeaker::spawn()),
             notifier: Arc::new(TauriNotifier::new(app)),
@@ -911,17 +978,28 @@ fn main() {
     // 鉴权状态在启动时就报出来：它要么意味着接口对本机全开，要么意味着宿主一定连不上，
     // 两种都得让人知道。**不在这里拦启动**——鉴权只管 `POST /rpc` 的准入，
     // 跟窗口、托盘、宠物渲染无关（理由见 `config::AuthGate::Locked`）。
-    match config::load_or_init().map(|(cfg, _)| cfg.auth_gate()) {
-        Ok(config::AuthGate::Token(_)) => {
+    // 顺带把「是不是首次启动」定下来。家目录建没建，只有这一次调用知道：同一进程里
+    // 之后每次 `load_or_init` 都会看到配置文件已存在而返回 `false`，而 `setup` 里加载
+    // 宠物包时还要再读一次——拿那次的结果当首次启动，「铺自带宠物」就永远不会发生，
+    // 全新安装的机器上 `~/.litepet/pets/` 会是空的，最后连 HTTP 都不启。
+    let (gate, first_run) = match config::load_or_init() {
+        Ok((cfg, created)) => (Some(cfg.auth_gate()), created),
+        Err(err) => {
+            log::warn!("读配置失败，暂时无法确定鉴权状态：{err:#}");
+            (None, false)
+        }
+    };
+    match gate {
+        Some(config::AuthGate::Token(_)) => {
             log::info!("鉴权已启用，token 取自 config.json 的 auth.token");
         }
-        Ok(config::AuthGate::Open) => log::warn!(
+        Some(config::AuthGate::Open) => log::warn!(
             "未设置 token（config.json 的 auth.token 为空）：接口不做鉴权，本机上任何程序都能连"
         ),
-        Ok(config::AuthGate::Locked) => log::error!(
+        Some(config::AuthGate::Locked) => log::error!(
             "config.json 里的 auth.token 含空白或非 ASCII 字符，这个值永远配不上：所有 HTTP 请求都会被拒绝，宿主连不上。请到设置页或 config.json 改成可见 ASCII 口令，或清空它表示不鉴权"
         ),
-        Err(err) => log::warn!("读配置失败，暂时无法确定鉴权状态：{err:#}"),
+        None => {}
     }
     // 监听端口在 `setup` 里才定下来（要读配置），但退出清理在主线程的
     // `RunEvent::Exit` 上跑，两者之间只能靠一个共享值传递。
@@ -933,12 +1011,14 @@ fn main() {
         // 「测试提醒」就 panic；而 panic 抛在 Tauri IPC 线程上会跨 FFI 边界，直接把
         // 整个进程带走，表现就是「程序直接退出」。
         .plugin(tauri_plugin_notification::init())
+        // 设置页的「选择文件」。没有它 `app.dialog()` 会直接 panic。
+        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             // 桌宠不需要 Dock 图标，也不需要在 Cmd+Tab 里露脸：托盘就是它的入口。
             // Accessory 正好去掉这两样。
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-            let (state, configured_port) = init_pet(app.handle());
+            let (state, configured_port) = init_pet(app.handle(), first_run);
             // 命令行优先于配置文件。
             let port = port.unwrap_or(configured_port);
             // 留给退出清理：它得知道对接文件里那个端口是不是自己写的。
@@ -955,7 +1035,8 @@ fn main() {
             pack_info,
             renderer_ready,
             renderer_applied,
-            local_call
+            local_call,
+            choose_sound_file
         ])
         .build(tauri::generate_context!());
     let app = match app {

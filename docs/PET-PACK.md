@@ -553,13 +553,15 @@ Codex 的 `PetFile` **没有 `deny_unknown_fields`**（§3.2）→ 同一份 `pe
 
 | 写法 | 解释 |
 |---|---|
-| 含 `/` | 包内相对路径，相对包目录（如 `sounds/done.wav`） |
-| `@语义名` | 语义音效名，按平台换到系统音效：`@done`（办妥了）、`@failed`（砸了）、`@attention`（要你看一眼） |
+| 含 `/`（或 `\\`） | 包内相对路径，相对包目录（如 `sounds/done.wav`） |
+| `@语义名` | 语义音效名：`@done`（办妥了）、`@failed`（砸了）、`@attention`（要你看一眼）。按序试 **用户自选 → 应用自带兜底 → 系统音效** |
 | 裸名字 | 先到包目录找同名文件，找不到再当系统音效名 |
+
+后两种的区别不是排版问题：**裸名字的这两步顺序不能反过来**。反了之后 `"done.wav"` 会被当成一个叫 `done.wav` 的系统音效，解析不到、静默失声，而它在配置里看起来完全没错（`src/alert/sound.rs` 的 `resolve`）。
 
 **找不到音效不是错误**：用户把包从别的平台搬过来、或系统没装某个音效，都是常见情况。记一条带建议的日志然后跳过声音通道。
 
-**为什么不强调用系统音效名**：Windows 与 Linux 根本没有 macOS 那套音效，靠名字跨平台必然时灵时不灵。想让听感跨平台一致，**包内自带音效是唯一的办法**（`sounds/*.wav` 随包走）。
+**为什么用语义名，而不是系统音效名**：Windows 与 Linux 根本没有 macOS 那套音效，靠名字跨平台必然时灵时不灵（Windows 的 `Media\Windows Notify.wav` 对不上我们写的候选名）。语义名这条链的**前两层是文件、随安装包走**，两个平台上听感一致；系统音效那层只做保命。
 
 #### 4.5.1 纯 Codex 包的默认提醒
 
@@ -567,20 +569,30 @@ Codex 的 `PetFile` **没有 `deny_unknown_fields`**（§3.2）→ 同一份 `pe
 
 | 事件 | 音效 | 提醒内容 |
 |---|---|---|
-| `agent.settled` | `Glass` | 整轮结束且不会自动继续——最值得打断主人的一件事 |
-| `agent.end`（**仅失败**） | `Basso` | 一轮以失败告终 |
+| `agent.settled` | `@done` | 整轮结束且不会自动继续——最值得打断主人的一件事 |
+| `agent.end`（**仅失败**） | `@failed` | 一轮以失败告终 |
+
+这里必须写**语义名**，不能写 `Glass` / `Basso`：解析链里「应用自带兜底」那层是按语义名存的（`assets/sounds/@done.wav`），写成具体名字就绕过了它，于是 Windows 上整轮结束会完全静音——**用户报的「没声音」正是这个**。`src/behavior.rs` 的 `fallback_alert_uses_semantic_names` 单测锁住这条。
 
 `agent.end` **成功不提醒**：屏幕上本来就在动，再响一次会很快变成噪声。有规则表的包写了自己的 `alert` 时，以规则表为准（`src/behavior.rs` 的 `fallback_alert` 只在没有任何规则命中该事件时兜底）。
 
 #### 4.5.2 用户侧开关（`config.json` 的 `notify` 段）
 
-包决定「哪些事件要提醒、响什么」，用户只决定「哪些通道允许响」。两者相与：包要响且用户开着，才真响。
+包决定「哪些事件要提醒、响什么」，用户只决定「哪些通道允许响」以及「语义名的声音换成什么文件」。两者相与：包要响且用户开着，才真响。
 
 ```jsonc
 // ~/.litepet/config.json
 "notify": {
   "enabled": true,                              // 总开关，关掉则整层静默
-  "sound":   { "enabled": true, "volume": 0.35 },
+  "sound": {
+    "enabled": true,
+    "volume": 0.35,
+    "files": {                                  // 自选音效，留空则走自带兜底
+      "done": "",                               // 整轮结束
+      "failed": "",                             // 一轮失败
+      "attention": ""                           // 要你看一眼
+    }
+  },
   "desktop": { "enabled": true },               // 系统通知
   "push": {                                    // 手机推送（Bark）
     "enabled": false,                          // 默认关：要用户自己填密钥
@@ -591,7 +603,12 @@ Codex 的 `PetFile` **没有 `deny_unknown_fields`**（§3.2）→ 同一份 `pe
 }
 ```
 
-整个 `notify` 段可缺省，缺省时逐字段补齐而不是整段报错；旧版配置里没有这个段也能正常读（`src/config.rs` 的 `notify_section_defaults_when_absent` 单测锁定）。
+`files` 的三个槽位就是上面 `@done` / `@failed` / `@attention` 解析链的第一层，填**绝对路径**（或在相对路径下能找到的文件）。两层意思要分清：
+
+- **自选只裁决语义槽位，不会劫持包作者点名的文件**。包作者写 `"sound": "sounds/boom.wav"` 是明确表态，用户配置不该覆盖它（`src/alert/sound.rs` 的 `user_choice_does_not_hijack_an_explicit_pack_path`）。
+- **配的那个文件不在了，按「没配」处理，不报错也不静默**。同一份 `config.json` 会在两台机器上被读到，另一台配的路径在这台必然不存在——那时正确答案是往下层走。
+
+整个 `notify` 段可缺省，缺省时逐字段补齐而不是整段报错；旧版配置里没有这个段、或 `files` 里少一个键，都能正常读（`src/config.rs` 的 `notify_section_defaults_when_absent` 单测锁定）。
 
 > 这里没有「人在不在」「前台是不是终端」这类字段：那个判断不属于 litepet，见 §4.6。
 

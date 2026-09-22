@@ -45,6 +45,45 @@
           <input id="sound-volume" type="range" min="0" max="1" step="0.05" />
           <output id="volume-out">—</output>
         </div>
+        <!-- 三个语义槽位对应三种事件（见 docs/PROTOCOL.md 的 `alert.sound`）。
+             输入框可以直接改：填配置路径、包内相对路径，或者 `@done` 这种语义名都行。 -->
+        <div class="row">
+          <span class="label">完成音</span>
+          <input
+            id="sound-done"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="留空 = 用宠物包内的，再不行用自带的"
+          />
+          <button id="pick-done">选择…</button>
+          <button id="play-done">试听</button>
+        </div>
+        <div class="row">
+          <span class="label">失败音</span>
+          <input
+            id="sound-failed"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="留空 = 用宠物包内的，再不行用自带的"
+          />
+          <button id="pick-failed">选择…</button>
+          <button id="play-failed">试听</button>
+        </div>
+        <div class="row">
+          <span class="label">提醒音</span>
+          <input
+            id="sound-attention"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="留空 = 用宠物包内的，再不行用自带的"
+          />
+          <button id="pick-attention">选择…</button>
+          <button id="play-attention">试听</button>
+        </div>
+        <p class="hint" id="sound-out">试听不看开关：关着也响，只看文件能不能播。</p>
         <label class="row">
           <input id="desktop-enabled" type="checkbox" />
           <span>系统通知</span>

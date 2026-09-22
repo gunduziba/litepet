@@ -78,6 +78,16 @@ pub const CONFIG_SET: &str = "config/set";
 /// 另一台机器（Windows）上就能直接验。
 pub const NOTIFY_TEST: &str = "notify/test";
 
+/// `notify/preview`：试听一条音效写法，返回实际命中的文件与它的来路。
+///
+/// 与 `notify/test` 的分工：后者回答「现在发得出什么」（过开关与规则表），
+/// 这个回答「这个文件能不能响」（过开关，只出声）。设置页选音效时需要的是后者——
+/// 「选择了文件却没声音」得当场能定位是文件的问题还是开关的问题。
+///
+/// `sound` 与规则表里的 `alert.sound` 是同一种写法（`@done`、`sounds/a.wav`、`Glass`），
+/// 因此也能拿去另一台机器上验「这条规则配的音效在这台机器上能不能响」。
+pub const NOTIFY_PREVIEW: &str = "notify/preview";
+
 /// daemon 级方法（`pet/*`、`config/*`）的出口。
 ///
 /// 为什么不塞进 [`Session`]：两者改的是**不同的状态**。`Session` 管「谁连上来了、
@@ -98,6 +108,10 @@ pub trait Daemon: Send + Sync {
     fn config_set(&self, params: &Value) -> Result<Value, ErrorObject>;
     /// 发一条测试提醒，返回实际发出去了哪些通道。
     fn notify_test(&self) -> Result<Value, ErrorObject>;
+    /// 试听一条音效写法（`sound` 的写法同 `alert.sound`），只出声。
+    ///
+    /// 返回实际命中的文件与来路；`path` 为 `null` 时说没有可播的文件（`hint` 里带原因）。
+    fn notify_preview(&self, sound: &str) -> Result<Value, ErrorObject>;
 }
 
 /// 处理链路上所有共享依赖。
@@ -283,6 +297,7 @@ pub fn call_daemon(
         CONFIG_GET => Some(daemon.config_get()),
         CONFIG_SET => Some(object_params(params, CONFIG_SET).and_then(|p| daemon.config_set(p))),
         NOTIFY_TEST => Some(daemon.notify_test()),
+        NOTIFY_PREVIEW => Some(sound_spec(params).and_then(|sound| daemon.notify_preview(&sound))),
         _ => None,
     }
 }
@@ -314,6 +329,24 @@ fn pet_id(params: Option<&Value>) -> Result<String, ErrorObject> {
             ErrorObject::new(
                 jsonrpc::INVALID_PARAMS,
                 format!("{PET_SELECT} 需要一个非空字符串参数 id"),
+            )
+        })
+}
+
+/// 取 `notify/preview` 的 `sound`。空字符串不算合法写法。
+///
+/// 不在这里校验写法是否认得：认不得的写法会解析不到文件，那正是调用方想知道的。
+fn sound_spec(params: Option<&Value>) -> Result<String, ErrorObject> {
+    params
+        .and_then(|params| params.get("sound"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|sound| !sound.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ErrorObject::new(
+                jsonrpc::INVALID_PARAMS,
+                format!("{NOTIFY_PREVIEW} 需要一个非空字符串参数 sound"),
             )
         })
 }
@@ -468,6 +501,16 @@ mod tests {
             Ok(json!({ "sound": null, "desktop": false, "push": false }))
         }
 
+        fn notify_preview(&self, sound: &str) -> Result<Value, ErrorObject> {
+            self.record(&format!("{NOTIFY_PREVIEW}:{sound}"));
+            Ok(json!({
+                "sound": sound,
+                "path": "/tmp/@done.wav",
+                "layer": "bundled",
+                "hint": null,
+            }))
+        }
+
         fn config_set(&self, params: &Value) -> Result<Value, ErrorObject> {
             self.record(CONFIG_SET);
             if params.get("size").and_then(Value::as_u64) == Some(0) {
@@ -598,7 +641,8 @@ mod tests {
 
         let alerts = harness.alerts();
         assert_eq!(alerts.len(), 1, "agent/settled 应产生一条提醒");
-        assert_eq!(alerts[0].spec.sound.as_deref(), Some("Glass"));
+        // 语义名，不是 `Glass`：后者在 Windows 上解析不到，会静默失声。
+        assert_eq!(alerts[0].spec.sound.as_deref(), Some("@done"));
         assert_eq!(alerts[0].title, "LitePet");
         assert_eq!(
             alerts[0].body, "这一轮干完了",
@@ -621,7 +665,7 @@ mod tests {
 
         let alerts = harness.alerts();
         assert_eq!(alerts.len(), 1, "两次表态里只该有一次提醒");
-        assert_eq!(alerts[0].spec.sound.as_deref(), Some("Basso"));
+        assert_eq!(alerts[0].spec.sound.as_deref(), Some("@failed"));
     }
 
     /// 调用被拒就不该提醒：参数写错的 `agent/end` 不该把主人从桌子那头叫过来。
@@ -829,6 +873,42 @@ mod tests {
             vec![PET_LIST.to_string(), CONFIG_GET.to_string()]
         );
         assert_eq!(harness.pushed(), 0, "daemon 级调用不该产生渲染指令");
+    }
+
+    /// `notify/preview` 的 sound 是必填且不能是空串。
+    ///
+    /// 空串不能放过去：它会安静地解析不到文件，而调用方拿到的是一个
+    /// 看起来合法、但什么也没验证的响应。
+    #[test]
+    fn notify_preview_requires_a_non_empty_sound() {
+        let harness = harness();
+        for params in [json!({}), json!({ "sound": "" }), json!({ "sound": "  " })] {
+            assert_eq!(
+                harness.error_code_of(json!({
+                    "jsonrpc": "2.0", "id": 1, "method": NOTIFY_PREVIEW, "params": params
+                })),
+                jsonrpc::INVALID_PARAMS as i64,
+                "{params} 应被拒"
+            );
+        }
+        assert!(harness.daemon_calls().is_empty(), "参数不合法就不该往下传");
+    }
+
+    /// 试听走的是 daemon 层，参数原样带到出口（写法不做校验，认不得的写法也是合法输入）。
+    #[test]
+    fn notify_preview_passes_the_sound_through() {
+        let harness = harness();
+        let result = harness.result_of(json!({
+            "jsonrpc": "2.0", "id": 1, "method": NOTIFY_PREVIEW,
+            "params": { "sound": "sounds/怪名字.wav" }
+        }));
+        assert_eq!(result["layer"], json!("bundled"));
+        assert_eq!(
+            harness.daemon_calls(),
+            vec![format!("{NOTIFY_PREVIEW}:sounds/怪名字.wav")],
+            "写法不该在网关这层被改写"
+        );
+        assert_eq!(harness.pushed(), 0, "试听不是渲染指令");
     }
 
     /// `pet/select` 的 id 是必填且不能是空串。

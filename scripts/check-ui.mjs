@@ -122,6 +122,8 @@ const sandbox = {
       core: {
         invoke: async (command, args) => {
           sent.push({ command, method: args?.method, params: args?.params });
+          // 文件对话框没法在这里开，用一个固定路径代替用户挑中的那个。
+          if (command === 'choose_sound_file') return '/tmp/picked-by-dialog.wav';
           return respond(args?.method, args?.params);
         },
         convertFileSrc: (path) => `asset://localhost/${encodeURIComponent(path)}`,
@@ -309,9 +311,78 @@ check(
   '「留空 = 不鉴权」现在只由 auth-token 的 placeholder 表达，不能删',
 );
 
+// 10. 三个音效槽位：回填、进补丁、试听（含来路）、以及「选择文件」。
+//     补丁里少一个 `files` 就等于把用户挑的音效清空——`config/set` 是按顶层键
+//     整块替换 `notify` 的，所以这条必须盯着。
+check(
+  registry.get('sound-done').value === '',
+  `未配的槽位应回填空串，实际「${registry.get('sound-done').value}」`,
+);
+check(
+  registry.get('sound-failed').value === 'sounds/boom.wav',
+  `包内相对路径应原样回填，实际「${registry.get('sound-failed').value}」`,
+);
+check(
+  registry.get('sound-attention').value === '/Users/eee/Music/bell.mp3',
+  `绝对路径应原样回填，实际「${registry.get('sound-attention').value}」`,
+);
+
+await Promise.all(registry.get('sound-failed').fire('change'));
+await settle();
+const soundPatch = sent.findLast((call) => call.method === 'config/set')?.params?.notify?.sound;
+check(soundPatch !== undefined, '改音效路径没触发 config/set');
+check(
+  soundPatch?.files?.done === '' &&
+    soundPatch?.files?.failed === 'sounds/boom.wav' &&
+    soundPatch?.files?.attention === '/Users/eee/Music/bell.mp3',
+  `补丁必须带全三个 files，否则保存会把它们清空：${JSON.stringify(soundPatch?.files)}`,
+);
+check(
+  soundPatch?.enabled === true && soundPatch?.volume === 0.35,
+  `音效补丁还应带 enabled/volume：${JSON.stringify(soundPatch)}`,
+);
+
+await Promise.all(registry.get('play-failed').fire('click'));
+await settle();
+const previewCall = sent.findLast((call) => call.method === 'notify/preview');
+check(previewCall !== undefined, '「试听」没发出 notify/preview');
+check(
+  previewCall?.params?.sound === 'sounds/boom.wav',
+  `试听应把填的值原样发出去，实际 ${JSON.stringify(previewCall?.params)}`,
+);
+// 命中时必须报来路：用户挑的与自带兑底听起来一样，不说清就分不出谁在响。
+check(
+  registry.get('sound-out').textContent.includes('/tmp/picked.wav') &&
+    registry.get('sound-out').textContent.includes('你挑的'),
+  `试听结果没说清响的是哪一个：${registry.get('sound-out').textContent}`,
+);
+
+// 空槽位试听的是语义名——那是它真没填时会发生的事（掉到包内 / 自带 / 系统）。
+await Promise.all(registry.get('play-done').fire('click'));
+await settle();
+check(
+  sent.findLast((call) => call.method === 'notify/preview')?.params?.sound === '@done',
+  '空槽位应拿 @done 去试听',
+);
+
+// 「选择文件」拿到路径就当场存盘，并且顺手试听一次。
+await Promise.all(registry.get('pick-done').fire('click'));
+await settle();
+check(
+  registry.get('sound-done').value === '/tmp/picked-by-dialog.wav',
+  `选完文件应回填到输入框，实际「${registry.get('sound-done').value}」`,
+);
+check(
+  sent.findLast((call) => call.method === 'config/set')?.params?.notify?.sound?.files?.done ===
+    '/tmp/picked-by-dialog.wav',
+  '选完文件应当场写进补丁（不能等用户再点一次保存）',
+);
+
 if (failures.length) {
   console.error(`UI 检查未通过（${failures.length} 项）：`);
   for (const failure of failures) console.error(`  ✗ ${failure}`);
   process.exit(1);
 }
-console.log('UI 检查通过：snake_case lint、CSS 注释与变量、设置页渲染/字段名/补丁范围/测试提醒/单个 token 的鉴权均正常。');
+console.log(
+  'UI 检查通过：snake_case lint、CSS 注释与变量、设置页渲染/字段名/补丁范围/测试提醒/单个 token 的鉴权/三个音效槽位均正常。',
+);

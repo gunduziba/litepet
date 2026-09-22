@@ -112,6 +112,19 @@ impl Config {
             );
             self.notify.sound.volume = clamped;
         }
+        // 路径多半是从别处粘过来的，尾部多一个空格就会让「文件明明在那儿」
+        // 变成找不到。这里只去空白，**不校验存在性**：存不存在是运行时的事
+        // （见 `crate::alert::sound`），在配置层判等于把跨平台的那份路径判死。
+        for path in [
+            &mut self.notify.sound.files.done,
+            &mut self.notify.sound.files.failed,
+            &mut self.notify.sound.files.attention,
+        ] {
+            let trimmed = path.trim().to_string();
+            if trimmed != *path {
+                *path = trimmed;
+            }
+        }
         if self.port == 0 {
             log::warn!("配置 port=0 没有可监听的含义，按 {} 处理", DEFAULT_PORT);
             self.port = DEFAULT_PORT;
@@ -230,6 +243,8 @@ pub struct SoundConfig {
     pub enabled: bool,
     /// 音量，`0.0..=1.0`；超出范围会被夹到边界。
     pub volume: f32,
+    /// 用户自选的三个语义音效（`docs/PET-PACK.md` §4.5.2）。
+    pub files: SoundFiles,
 }
 
 impl Default for SoundConfig {
@@ -237,8 +252,29 @@ impl Default for SoundConfig {
         Self {
             enabled: true,
             volume: DEFAULT_SOUND_VOLUME,
+            files: SoundFiles::default(),
         }
     }
+}
+
+/// 用户自选的三类语义音效文件。
+///
+/// 三个键与 `alert.sound` 的语义名一一对应（`@done` / `@failed` / `@attention`）。
+/// 刻意**不是**一个事件一张表：事件多得很，语义只有这三类，逐事件配只会跟宠物包
+/// 的规则表打架（理由同 [`NotifyConfig`] 的注释）。
+///
+/// 值是一个绝对路径字符串，空串表示「没配」。这里刻意不做存在性校验：
+/// 同一份 `config.json` 会被 macOS 与 Windows 读到，另一台机器上那个路径必然
+/// 不存在——那不是用户的错，也不该因此把他的配置悄悄清掉。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SoundFiles {
+    /// 「办妥了」：`@done` 用。
+    pub done: String,
+    /// 「砸了」：`@failed` 用。
+    pub failed: String,
+    /// 「要你看一眼」：`@attention` 用。
+    pub attention: String,
 }
 
 /// 系统通知通道配置。
@@ -549,6 +585,19 @@ mod tests {
         assert!(cfg.notify.sound.enabled, "未提到的通道保持默认");
     }
 
+    /// 三个语义音效槽位要经得起「从别处粘过来」：首尾空白必须去掉，
+    /// 否则文件明明在，报的却是找不到。全是空白则等于没配。
+    #[test]
+    fn sound_file_paths_are_trimmed() {
+        let raw = r#"{"notify":{"sound":{"files":{
+            "done":" /tmp/done.wav ","failed":"/tmp/failed.wav","attention":"  "}}}}"#;
+        let mut cfg: Config = serde_json::from_str(raw).expect("应能解析音效路径");
+        cfg.normalize();
+        assert_eq!(cfg.notify.sound.files.done, "/tmp/done.wav");
+        assert_eq!(cfg.notify.sound.files.failed, "/tmp/failed.wav");
+        assert_eq!(cfg.notify.sound.files.attention, "", "全是空白等于没配");
+    }
+
     /// 落盘后的 `notify` 段字段名是外部契约（`docs/PET-PACK.md` §4.5.2 的样例
     /// 与用户手写的配置都靠它），所以用 camelCase 锁住，不能被结构体重命名悄悄改掉。
     #[test]
@@ -561,6 +610,13 @@ mod tests {
             notify["sound"]["volume"],
             serde_json::json!(DEFAULT_SOUND_VOLUME)
         );
+        for slot in ["done", "failed", "attention"] {
+            assert_eq!(
+                notify["sound"]["files"][slot],
+                serde_json::json!(""),
+                "{slot} 缺省是空串，表示没配"
+            );
+        }
         assert_eq!(notify["desktop"]["enabled"], serde_json::json!(true));
         assert_eq!(notify["push"]["enabled"], serde_json::json!(false));
         assert_eq!(

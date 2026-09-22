@@ -63,7 +63,7 @@ daemon 在**端口绑定成功之后**写出端点文件，宿主读它拿端口
 
 - **宿主侧零依赖**：pi 用 `fetch`、dsh 用标准库 HTTP 客户端即可，不必引 socket 库、不必自己处理帧边界与粘包
 - **没有「连接」这层状态**：不存在「连上了但没注册」「连接半开」「EOF 与 ECONNRESET 区分」这些情形，宿主崩溃天然无副作用，不需要指数退避重连
-- **可手工验证**：`curl` 一条命令就能发事件，不必装 socat（见 §10）
+- **可手工验证**：`curl` 一条命令就能发事件，不必装 socat（见 §11）
 - **代价**（已知并接受）：每个事件一次 TCP 往返（回环上约几十微秒，相对 4s 的气泡生命周期可忽略）；daemon 不能主动推消息，只能应答（见 §2）
 
 ### 1.3 HTTP 状态码 vs JSON-RPC 错误码
@@ -293,7 +293,127 @@ idle ──agent.start──► working ──agent.end(success)──► celebr
 
 **第三个通道：提醒**。上表只管屏幕上的宠物与气泡；提醒（声音 / 系统通知 / 手机推送）是**独立的旁路**，用不用它由规则表的 `alert` 字段决定（`docs/PET-PACK.md` §4.5）。没有规则命中时，有两个包通用的默认提醒：`agent/settled`（出声 + 通知）与失败的 `agent/end`。提醒内容没有气泡可借时用事件自带的一句话（如 `agent.settled` → 「这一轮干完了」），所以提醒永远不会是空壳。
 
-## 10. 手工验证
+## 10. 客户端 → daemon：daemon 级控制方法
+
+§4 与 §5 讲的是宿主（pi / dsh 适配器）与自己那只宠物的对话。这一节是**设置窗口与脚本**用的入口：读写配置、换宠物、试提醒。
+
+**同一个 `/rpc` 端点、同一套信封与鉴权**（§1），不另外开端口。这些方法**不要求 `params.host`**，也**不注册宿主**——它们不碰会话状态机，因此不受 §6 仲裁影响。反过来它们影响所有宿主：`config/set` 改的是全局配置。
+
+| method | 类型 | 参数 | `result` |
+|---|---|---|---|
+| `pet/list` | 请求 | — | `pets: PetSummary[]`, `current: string \| null` |
+| `pet/select` | 请求 | `id: string` | 新包的公开信息（`PetInfo`） |
+| `config/get` | 请求 | — | `config`, `home`, `log`, `petsRoot`, `justCreated`, `version` |
+| `config/set` | 请求 | 配置补丁（§10.4） | `config`（**归一化之后**）, `restartRequired: string[]` |
+| `notify/test` | 请求 | — | `sound: boolean`, `desktop: boolean`, `push: boolean` |
+| `notify/preview` | 请求 | `sound: string` | `sound`, `path: string \| null`, `layer`, `hint` |
+
+字段名一律 **camelCase**（与 §4 的 `params` 一致）。
+
+### 10.1 `pet/list`
+
+```json
+{ "jsonrpc":"2.0", "result": {
+  "pets": [
+    { "dir":"xunjian-miao", "id":"xunjian-miao", "displayName":"巡检喵",
+      "description":"……", "spritesheetPath":"/Users/me/.litepet/pets/xunjian-miao/spritesheet.webp",
+      "frame":{ "width":192, "height":208, "columns":8, "rows":9 },
+      "problem": null }
+  ],
+  "current": "xunjian-miao"
+}, "id": 5 }
+```
+
+**坏包也要列出来**，`problem` 里写坏在哪（清单读不通、图集缺、网格不合法），`spritesheetPath` / `frame` 为 `null`。用户明明装了它，凭空消失只会让人怀疑自己装错了地方。`spritesheetPath` 与 `frame` 是给设置页画首帧预览用的，缺一就画不出来，所以坏包要如实说缺哪个。
+
+列表**按目录名排序**：`read_dir` 的顺序各文件系统不同，配置页每次刷新看到的顺序都变一遭会很难用。`petsRoot` 还不存在时返回空数组而不是报错。
+
+### 10.2 `pet/select`
+
+切当前宠物包，返回新包的公开信息（结构同 `PetInfo`：`id` / `displayName` / `description` / `spritesheetPath` / `frame` / `animations`）。
+
+失败（包不存在、清单不合法、`litepet.behavior` 非法）回 `-32602`，且**整件事不发生**——不留「画面换了、动作却对不上」的宠物。顺序是有意的：先换会话里的规则表，再换渲染层那份。
+
+换包有三个连带动作：渲染层重新加载图集（动画名集合多半变了）、提醒层重新解析音效（`alert.sound` 里的相对路径是相对**包目录**的）、把 `id` 记进配置好在下次启动时恢复。
+
+### 10.3 `config/get`
+
+```json
+{ "jsonrpc":"2.0", "result": {
+  "config": { "...": "见 docs/PET-PACK.md §4.5.2" },
+  "home": "/Users/me/.litepet", "log": "/Users/me/.litepet/logs/litepet.log",
+  "petsRoot": "/Users/me/.litepet/pets",
+  "justCreated": false, "version": "0.1.0"
+}, "id": 6 }
+```
+
+`home` / `log` / `petsRoot` 一并给出去，是为了让设置页能显示「东西都在哪」并能一键打开；`justCreated` 为 `true` 表示这次读配置时才刚生成默认文件（设置页可以据此说一句「已生成默认配置」）。配置读不出来回 `-32603`（内部错误），不是参数错。
+
+### 10.4 `config/set`
+
+参数就是一份**配置补丁**：扁平地给出**要改的顶层键**，值是该键的完整新值。
+
+```json
+{ "jsonrpc":"2.0", "method":"config/set", "id":7,
+  "params": { "size": 240, "notify": { "enabled": true, "sound": { "enabled": true,
+    "volume": 0.35, "files": { "done":"", "failed":"", "attention":"" } },
+    "desktop": { "enabled": true }, "push": { "enabled": false, "provider":"bark",
+    "deviceKey":"", "endpoint": null } },
+    "auth": { "token": "" } } }
+```
+
+两条规则必须记牢，它们决定了调用方该怎么供货：
+
+1. **没提到的顶层键保持原值**。所以设置页只发改动过的那几个键，不需要先 `config/get` 再整份回写。
+2. **提到了的那个顶层键是整块替换**。只发 `notify.sound` 就会把 `notify.desktop` / `notify.push` 一起打回默认值——不是保留旧值。所以**改 `notify` 里的任何一项，都要带上完整的 `notify` 块**；改 `sound.files` 里的任何一个槽位，都要带上三个槽位。少发一个 `files` 就等于把它清空，用户挑半天的音效会在下一次保存时静静地消失（设置页的 `collect()` 因此总是凑齐整块，`scripts/check-ui.mjs` 里有一条断言盯着它）。
+
+应答里的 `config` 是**归一化之后**的实际值，前端应当用它回填，而不是拿自己发出去的值当准（越界音量会被夹到范围内、空 `endpoint` 会变成 `null`、缺字段会补默认值）。字段不合法回 `-32602`；写盘失败回 `-32603`。
+
+`restartRequired` 列出**要重启才生效的顶层键**，目前只可能是 `port`：监听早就绑好了。宠物包、窗口尺寸、提醒开关都能当场生效，daemon 不假装改不了的也已经改了。
+
+### 10.5 `notify/test`
+
+立刻发一条测试提醒，返回**哪些通道真的发出去了**：
+
+```json
+{ "jsonrpc":"2.0", "result": { "sound": true, "desktop": true, "push": false }, "id": 8 }
+```
+
+它走的就是真实提醒那条路（同一个 `dispatch`，过总开关与通道开关），只是事件与内容换成固定的测试用文本。另起一条测试专用路径只会验证出一条真实事件走不到的路。`push: false` 的常见原因是没填 Bark 密钥或那一项关着——这正是它存在的理由：「token 到底对不对」只有真发一次才知道，而推送凭据只存在 daemon 侧。
+
+### 10.6 `notify/preview`
+
+试听**一条音效写法**（写法与规则表里的 `alert.sound` 完全相同，见 `docs/PET-PACK.md` §4.5），只出声、不动通知与推送：
+
+```json
+{ "jsonrpc":"2.0", "method":"notify/preview", "id":9,
+  "params": { "sound": "@done" } }
+→ { "jsonrpc":"2.0", "result": {
+      "sound": "@done",
+      "path": "/Applications/LitePet.app/Contents/Resources/sounds/@done.wav",
+      "layer": "bundled", "hint": null }, "id":9 }
+```
+
+- `path` 是**真实命中的那个文件**，`layer` 说它是哪一层给的：`user`（用户自选）→ `bundled`（应用自带兜底）→ `pack`（宠物包内）→ `system`（当前平台系统音效）。
+- `path` 为 `null` 时说明没有可播的文件，`hint` 里带一条能照着做的建议。**这不是错误码**：找不到音效是常见情形（包从别的平台搬来、系统没装），回的是 `result` 而不是 `error`。
+- **它不看总开关，也不看规则的 `alert`**：只回答「这个文件能不能响」。与 `notify/test` 的分工正在这里——后者回答「现在发得出什么」，前者回答「这个写法落到哪个文件上」。「用户选了文件却没声音」得当场能定位到底是文件的问题还是开关的问题。
+- `sound` 是必填，且不能是空串（空串回 `-32602`）。
+
+因为写法与规则表一致，它也能拿去另一台机器上验「这条规则配的音效在这台机器上能不能响」。
+
+### 10.7 鉴权与错误
+
+这六个方法与 §4 的事件走**同一个**准入：`config.json` 的 `auth.token` 留空则谁都能调，填了就要求每条请求都带 `Authorization: Bearer <token>`（§1）。设置窗口与 `curl` 都不例外——它改的是全局配置，不该比发事件更宽松。
+
+| 情形 | 应答 |
+|---|---|
+| 缺 / 错的 `Authorization` | HTTP 401（`auth.token` 非空时） |
+| `auth.token` 含空白或非 ASCII（永远配不上） | HTTP **503**，不是 401——问题在 daemon 这边没配好，401 会让人反复去检查宿主那侧的 token |
+| 未知 `method` | `-32601` |
+| `pet/select` 的包不存在 / 不合法，`notify/preview` 的 `sound` 为空，`config/set` 字段不合法 | `-32602` |
+| 读配置、写配置、序列化失败 | `-32603` |
+
+## 11. 手工验证
 
 **推荐用仓库里的零依赖模拟器**（它自己会等 `daemon.json` 出现再连）：
 

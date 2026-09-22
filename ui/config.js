@@ -18,6 +18,27 @@ function rpc(method, params) {
   return invoke('local_call', { method, params: params ?? null });
 }
 
+/**
+ * 三个音效槽位：事件语义 → 配置字段名。
+ *
+ * `semantic` 是槽位为空时试听用的东西：那会走与真实提醒完全一样的解析链
+ * （用户配置 → 宠物包内 → 应用自带 → 系统音效），所以听见的就是真出事时会响的那个。
+ * 语义名与 `docs/PROTOCOL.md` 里 `alert.sound` 的写法一致。
+ */
+const SOUND_SLOTS = [
+  { key: 'done', semantic: '@done', label: '完成音' },
+  { key: 'failed', semantic: '@failed', label: '失败音' },
+  { key: 'attention', semantic: '@attention', label: '提醒音' },
+];
+
+/** 音效来路的中文名。`Layer::as_str` 的镜像，见 src/alert/sound.rs。 */
+const LAYER_LABELS = {
+  user: '你挑的',
+  bundled: '应用自带',
+  pack: '宠物包内',
+  system: '系统音效',
+};
+
 /** 上一次从 daemon 读到的配置；推送的 provider 要从这里带回去，免得被覆盖掉。 */
 let loaded = null;
 
@@ -48,6 +69,9 @@ function fill(config) {
   el('sound-enabled').checked = notify.sound.enabled;
   el('sound-volume').value = String(notify.sound.volume);
   el('volume-out').textContent = `${Math.round(notify.sound.volume * 100)}%`;
+  for (const slot of SOUND_SLOTS) {
+    el(`sound-${slot.key}`).value = notify.sound.files[slot.key];
+  }
   el('desktop-enabled').checked = notify.desktop.enabled;
   el('push-enabled').checked = notify.push.enabled;
   // 密钥用密码框之外的普通输入框：它多数时候是个本地服务地址，
@@ -97,6 +121,12 @@ function collect() {
       sound: {
         enabled: el('sound-enabled').checked,
         volume: Number(el('sound-volume').value),
+        // 三个路径**必须一起带上**：`config/set` 是按顶层键整块替换 `notify` 的
+        // （见 src/config.rs 的补丁合并），少发一个 `files` 就等于把它清空——
+        // 用户挑半天的音效会在任何一次保存时静静地消失。
+        files: Object.fromEntries(
+          SOUND_SLOTS.map((slot) => [slot.key, el(`sound-${slot.key}`).value.trim()]),
+        ),
       },
       desktop: { enabled: el('desktop-enabled').checked },
       push: {
@@ -257,6 +287,51 @@ async function testAlert() {
   }
 }
 
+/** 把一个音效槽位试听一遍。 */
+async function previewSound(slot) {
+  const out = el('sound-out');
+  // 空着就试听语义名——那才是这个槽位真的没填时会发生的事。
+  const raw = el(`sound-${slot.key}`).value.trim() || slot.semantic;
+  out.textContent = `${slot.label}：…`;
+  try {
+    const result = await rpc('notify/preview', { sound: raw });
+    out.textContent = `${slot.label}：${describePreview(result)}`;
+  } catch (err) {
+    out.textContent = `${slot.label}：${err}`;
+  }
+}
+
+/**
+ * 把试听结果说成人话。
+ *
+ * 命中时**一定要报来路**：用户挑的文件与应用自带的兜底听起来一模一样，
+ * 不写清就分不出「我挑的那个到底生效了没」。
+ */
+function describePreview(result) {
+  if (!result.path) {
+    return result.hint ?? '没找到能播的文件';
+  }
+  return `响的是 ${result.path}（${LAYER_LABELS[result.layer] ?? result.layer}）`;
+}
+
+/** 挑一个音效文件：拿到路径就当场存下并响一声。 */
+async function chooseSound(slot) {
+  let picked = null;
+  try {
+    picked = await invoke('choose_sound_file');
+  } catch (err) {
+    toast(String(err), true);
+    return;
+  }
+  // 取消（或拿到的是个还原不成路径的地址）就什么也不动：保持原样比清空强。
+  if (!picked) return;
+  el(`sound-${slot.key}`).value = picked;
+  await save();
+  // 选完顺手响一声：挑了个放不出来的文件是这里最常见的坑，
+  // 而它只有在真的播一次时才会暴露。
+  await previewSound(slot);
+}
+
 /** 渲染路径信息。 */
 function renderPaths(info) {
   const rows = [
@@ -314,6 +389,13 @@ async function boot() {
   // 文本框在失焦或回车时才写盘。
   for (const id of ['push-key', 'push-endpoint', 'auth-token']) {
     el(id).addEventListener('change', save);
+  }
+  for (const slot of SOUND_SLOTS) {
+    // 音效路径可以直接手改：写包内相对路径（`sounds/x.wav`）或语义名（`@done`）
+    // 都是合法的，所以它是个文本框，而不只是个显示框。
+    el(`sound-${slot.key}`).addEventListener('change', save);
+    el(`pick-${slot.key}`).addEventListener('click', () => chooseSound(slot));
+    el(`play-${slot.key}`).addEventListener('click', () => previewSound(slot));
   }
   el('test').addEventListener('click', testAlert);
 }

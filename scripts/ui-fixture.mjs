@@ -15,7 +15,16 @@ export const CONFIG_GET = {
       desktop: { enabled: true },
       enabled: true,
       push: { deviceKey: '', enabled: false, endpoint: null, provider: 'bark' },
-      sound: { enabled: true, volume: 0.35 },
+      sound: {
+        enabled: true,
+        volume: 0.35,
+        // 三种写法各有一个：空（用包内/自带兑底）、包内相对路径、用户挑的绝对路径。
+        files: {
+          attention: '/Users/eee/Music/bell.mp3',
+          done: '',
+          failed: 'sounds/boom.wav',
+        },
+      },
     },
     pet: null,
     port: 4590,
@@ -71,6 +80,12 @@ export function respond(method, params) {
       return { config: { ...CONFIG_GET.config, ...params }, restartRequired: [] };
     case 'notify/test':
       return { sound: '默认音效', desktop: true, push: false };
+    case 'notify/preview':
+      // 复刻真 daemon 的两种结果（见 src/alert/mod.rs 的 `preview`）：
+      // 能落到文件上就报路径与来路，落不到就 `path: null` + 一条能照着做的建议。
+      return params.sound.includes('does-not-exist')
+        ? { sound: params.sound, path: null, layer: null, hint: '这个文件不存在，换个文件试试' }
+        : { sound: params.sound, path: '/tmp/picked.wav', layer: 'user', hint: null };
     default:
       throw new Error(`设置页调了未预期的 RPC：${method}`);
   }
