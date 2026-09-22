@@ -176,14 +176,14 @@ daemon 只在应答请求时说话，没有主动推送。
 |---|---|---|
 | `host/hello` | `daemonVersion: string`, `petId: string`, `protocolVersion: number` | 注册确认 |
 | `daemon/ping` | `host: string`, `protocolVersion: number`, `ts: number` | 心跳回应，原样回显宿主 `ts` |
-| `daemon/info` | `daemonVersion`, `protocolVersion`, `petId`, `resident: boolean`, `hostCount: number`, `pingIntervalMs: number`, `hostTimeoutMs: number` | daemon 现状 |
+| `daemon/info` | `daemonVersion`, `protocolVersion`, `petId`, `hostCount: number`, `pingIntervalMs: number`, `hostTimeoutMs: number` | daemon 现状 |
 
 `daemon/info` 实际响应示例：
 
 ```json
 { "jsonrpc":"2.0", "result": {
   "daemonVersion": "0.1.0", "protocolVersion": 1, "petId": "xunjian-miao",
-  "resident": false, "hostCount": 1, "pingIntervalMs": 20000, "hostTimeoutMs": 60000
+  "hostCount": 1, "pingIntervalMs": 20000, "hostTimeoutMs": 60000
 }, "id": 4 }
 ```
 
@@ -302,7 +302,7 @@ idle ──agent.start──► working ──agent.end(success)──► celebr
 | method | 类型 | 参数 | `result` |
 |---|---|---|---|
 | `pet/list` | 请求 | — | `pets: PetSummary[]`, `current: string \| null` |
-| `pet/select` | 请求 | `id: string` | 新包的公开信息（`PetInfo`） |
+| `pet/select` | 请求 | `id: string`（目录名，或清单里的 `id`） | 新包的公开信息（`PetInfo`） |
 | `config/get` | 请求 | — | `config`, `home`, `log`, `petsRoot`, `justCreated`, `version` |
 | `config/set` | 请求 | 配置补丁（§10.4） | `config`（**归一化之后**）, `restartRequired: string[]` |
 | `notify/test` | 请求 | — | `sound: boolean`, `desktop: boolean`, `push: boolean` |
@@ -323,6 +323,10 @@ idle ──agent.start──► working ──agent.end(success)──► celebr
   "current": "xunjian-miao"
 }, "id": 5 }
 ```
+
+**`dir` 与 `id` 是两个不同的东西**：`dir` 是目录名，也就是包的规范身份——`pet/select` 传的是它；`id` 是清单里的值，只用于展示。
+
+两者可以不同：社区下载的包目录名常带后缀（`kun-signature.codex-pet/`），而清单里写的 `id` 是 `kun-signature`。daemon 两侧都认（先按目录名找，再扫目录比对清单 `id`）；几个包的清单 `id` 撞车时报错并列出候选目录，而不是猜一个。`current` 取的是清单 `id`。
 
 **坏包也要列出来**，`problem` 里写坏在哪（清单读不通、图集缺、网格不合法），`spritesheetPath` / `frame` 为 `null`。用户明明装了它，凭空消失只会让人怀疑自己装错了地方。`spritesheetPath` 与 `frame` 是给设置页画首帧预览用的，缺一就画不出来，所以坏包要如实说缺哪个。
 
