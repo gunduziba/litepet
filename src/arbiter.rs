@@ -550,21 +550,33 @@ impl Arbiter {
         };
         for entry in self.hosts.values() {
             if let Some(until) = entry.feedback_until {
-                shrink(until.saturating_duration_since(now));
+                if until > now {
+                    shrink(until.duration_since(now));
+                }
             }
             if let Some(at) = entry
                 .override_play
                 .as_ref()
                 .and_then(|over| over.expires_at)
             {
-                shrink(at.saturating_duration_since(now));
+                if at > now {
+                    shrink(at.duration_since(now));
+                }
             }
             if let Some(bubble) = entry.bubble.as_ref() {
-                shrink(bubble.expires_at.saturating_duration_since(now));
+                if bubble.expires_at > now {
+                    shrink(bubble.expires_at.duration_since(now));
+                }
             }
             // 空闲到现在已过多久决定 resting 何时触发。
             let elapsed = now.saturating_duration_since(entry.last_event);
-            shrink(behavior.idle_timeout().saturating_sub(elapsed));
+            let idle_timeout = behavior.idle_timeout();
+            if elapsed < idle_timeout {
+                shrink(idle_timeout - elapsed);
+            } else {
+                // 已进入 resting 状态，按组内轮换节奏调度，避免 0ms 空转死循环。
+                shrink(Duration::from_millis(GROUP_ROTATE_MS));
+            }
         }
         if !self.hosts.is_empty() {
             shrink(Duration::from_millis(BUBBLE_ROTATE_MS));
@@ -896,6 +908,19 @@ mod tests {
         let arbiter = arbiter_with("pi", now);
         let behavior = behavior();
         assert!(arbiter.next_deadline(now, &behavior) <= behavior.idle_timeout());
+    }
+
+    #[test]
+    fn deadline_after_idle_timeout_does_not_zero() {
+        let now = Instant::now();
+        let arbiter = arbiter_with("pi", now);
+        let behavior = behavior();
+        let later = now + Duration::from_secs(95);
+        let dl = arbiter.next_deadline(later, &behavior);
+        assert!(
+            dl > Duration::ZERO,
+            "闲置超时后 next_deadline 绝不该归零：实际为 {dl:?}"
+        );
     }
 
     #[test]

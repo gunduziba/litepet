@@ -36,6 +36,11 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// 超过该时长没收到该宿主任何消息（含心跳），即认定它已死。
 pub const HOST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// 空转唤醒的最小间隔（避免极端时钟抖动或边界计算导致 busy-loop 死循环）。
+pub const MIN_TICK_INTERVAL: Duration = Duration::from_millis(50);
+/// 空转唤醒的最大间隔（确保死宿主回收与时间推进精度）。
+pub const MAX_TICK_INTERVAL: Duration = Duration::from_secs(1);
+
 /// 构造会话所需的、由外部注入的静态信息。
 #[derive(Debug, Clone)]
 pub struct Setup {
@@ -180,9 +185,9 @@ impl Session {
     /// 距离下一次必须空转还差多久。
     pub fn next_deadline(&self, now: Instant) -> Duration {
         let next = self.arbiter.next_deadline(now, &self.behavior);
-        // 兜底：即使这一层判不出任何变化，也别让 tick 线程睡死。
-        // 死宿主的回收精度也因此不会差于 1s。
-        next.min(Duration::from_secs(1))
+        // 限制在安全区间 [50ms, 1s]：既不给 tick 线程睡死（保证死宿主回收精度），
+        // 也不允许 0ms 空转死循环吃满 CPU。
+        next.clamp(MIN_TICK_INTERVAL, MAX_TICK_INTERVAL)
     }
 
     /// 分发一次调用。
@@ -1121,8 +1126,15 @@ mod tests {
         let now = Instant::now();
         let mut session = session();
         send(&mut session, protocol::method::HOST_HELLO, hello("pi"), now);
-        // 不给 tick 线程睡死的可能。
-        assert!(session.next_deadline(now) <= Duration::from_secs(1));
+        // 不给 tick 线程睡死的可能，也不允许 0ms 忙轮询死循环。
+        let dl = session.next_deadline(now);
+        assert!(dl <= MAX_TICK_INTERVAL);
+        assert!(dl >= MIN_TICK_INTERVAL);
+
+        // 闲置超过 idleTimeout 后依然受下限保护，绝不会归零
+        let idle_dl = session.next_deadline(now + Duration::from_secs(95));
+        assert!(idle_dl <= MAX_TICK_INTERVAL);
+        assert!(idle_dl >= MIN_TICK_INTERVAL);
     }
 
     /// 一份「整轮结束就提醒」的规则表，用来验提醒正文的四级链。

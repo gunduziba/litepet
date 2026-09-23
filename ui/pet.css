@@ -28,6 +28,9 @@ body:active {
   inset: 0;
   background-color: transparent;
   background-repeat: no-repeat;
+  /* 开启独立 GPU 合成层，避免频繁变动 background-position 导致整窗重排重绘 */
+  will-change: background-position;
+  transform: translateZ(0);
   /* 不做 pixelated：多数素材是平滑绘制的，放大时保留插值更好看 */
 }
 
