@@ -22,11 +22,15 @@ jobs:
       matrix:
         include:
           - platform: macos-latest
-            artifact-name: LitePet-macOS
+            args: '--target universal-apple-darwin'
+            artifact-name: LitePet-macOS-Universal
             asset-path: |
+              target/universal-apple-darwin/release/bundle/dmg/*.dmg
+              target/universal-apple-darwin/release/bundle/macos/*.app
               target/release/bundle/dmg/*.dmg
               target/release/bundle/macos/*.app
           - platform: windows-latest
+            args: ''
             artifact-name: LitePet-Windows
             asset-path: |
               target/release/bundle/nsis/*.exe
@@ -46,6 +50,8 @@ jobs:
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Rust 构建缓存
         uses: swatinem/rust-cache@v2
@@ -58,6 +64,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          args: ${{ matrix.args }}
           tagName: v__VERSION__
           releaseName: 'LitePet v__VERSION__'
           releaseBody: |
@@ -65,7 +72,7 @@ jobs:
             
             本安装包由 GitHub Actions 自动编译打包完成：
             - **Windows**: `.exe`（NSIS 一键安装包）
-            - **macOS**: `.dmg`（Apple Silicon 原生磁盘镜像包）
+            - **macOS**: `.dmg`（Universal 通用架构，同时兼容 Apple Silicon M 系列与 Intel 处理器）
             
             更多使用说明请参阅 [项目 README](https://github.com/gunduziba/litepet)。
           releaseDraft: ${{ inputs.draft || false }}
