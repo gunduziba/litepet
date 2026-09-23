@@ -1,0 +1,12 @@
+{
+  "name": "litepet",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop pet daemon for AI coding agents",
+  "scripts": {
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}
