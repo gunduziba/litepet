@@ -1,3 +1,6 @@
+// 防止 Windows 在 Release 模式下双击启动弹出终端控制台黑窗口。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! litepet 入口。
 //!
 //! 架构与约束见 `SPEC.md`，宠物包契约见 `docs/PET-PACK.md`，通信协议见 `docs/PROTOCOL.md`。
