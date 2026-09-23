@@ -23,10 +23,14 @@ jobs:
         include:
           - platform: macos-latest
             artifact-name: LitePet-macOS
-            asset-path: target/release/bundle/dmg/*.dmg
+            asset-path: |
+              target/release/bundle/dmg/*.dmg
+              target/release/bundle/macos/*.app
           - platform: windows-latest
             artifact-name: LitePet-Windows
-            asset-path: target/release/bundle/nsis/*.exe
+            asset-path: |
+              target/release/bundle/nsis/*.exe
+              target/release/bundle/msi/*.msi
 
     runs-on: ${{ matrix.platform }}
 
@@ -37,7 +41,7 @@ jobs:
       - name: 配置 Node.js 环境
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: lts/*
           cache: 'npm'
 
       - name: 安装 Rust 工具链
