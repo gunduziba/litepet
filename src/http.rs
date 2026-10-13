@@ -34,8 +34,6 @@ pub const RPC_PATH: &str = "/rpc";
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 /// 处理请求的工作线程数。
 const WORKERS: usize = 4;
-/// 工作线程每次等待请求的时长，决定退出时的响应延迟。
-const POLL: Duration = Duration::from_millis(500);
 /// 探测已有实例的超时；回环连接不需要久等。
 const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 /// 鉴权没过时的应答。
@@ -153,10 +151,10 @@ pub fn serve(server: Server, shared: Arc<Shared>) {
         let server = Arc::clone(&server);
         let shared = Arc::clone(&shared);
         std::thread::spawn(move || loop {
-            match server.recv_timeout(POLL) {
-                Ok(Some(request)) => handle(request, &shared),
-                // 超时是正常的：空转交给 ticker 线程，这里只是回来看看有没有新请求。
-                Ok(None) => {}
+            // 阻塞等待而不是带超时轮询：没有任何东西需要工作线程「回来看看」，
+            // 4 个线程各每 500ms 醒一次纯属白白唤醒 CPU。
+            match server.recv() {
+                Ok(request) => handle(request, &shared),
                 Err(err) => {
                     log::error!("接收请求失败，该工作线程退出：{err}");
                     return;

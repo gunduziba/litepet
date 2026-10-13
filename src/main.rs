@@ -918,6 +918,11 @@ fn set_pet_visible(app: &tauri::AppHandle, visible: bool) {
     if let Err(err) = result {
         log::warn!("切换宠物窗口可见性失败：{err}");
     }
+    // 告诉渲染层停/续帧定时器：窗口藏起来后 webview 的定时器并不一定被系统节流，
+    // 看不见还逐帧切图纯属空耗。
+    if let Err(err) = window.emit("pet-visibility", visible) {
+        log::warn!("推送窗口可见性失败：{err}");
+    }
 }
 
 /// 托盘「回到主屏」：把宠物摆回主屏右下角并落盘。

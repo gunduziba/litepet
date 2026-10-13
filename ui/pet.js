@@ -23,6 +23,8 @@ let cellH = 0;
 /** 上一次生效的气泡文本与类型（用于 DOM 变更去重）。 */
 let lastBubbleText = null;
 let lastBubbleKind = null;
+/** 窗口是否可见；不可见时停掉帧定时器，不再逐帧切图。 */
+let visible = true;
 /** 上一次回报给 daemon 的动画与气泡（用于 IPC 去重）。 */
 let lastAppliedAnimation = '';
 let lastAppliedBubble = null;
@@ -66,6 +68,8 @@ function redraw() {
 /** 排下一帧。 */
 function schedule() {
   clearTimeout(timer);
+  // 看不见时只记住动画名与帧号，露脸时由 setVisible 从这一帧续上。
+  if (!visible) return;
   const plan = pack.animations[currentName];
   const frame = plan.frames[frameIndex];
   render(frame.spriteIndex);
@@ -152,10 +156,22 @@ function usePack(info) {
   play(names.includes('idle') ? 'idle' : names[0]);
 }
 
+/** 窗口显隐切换：藏起来停帧，露出来从当前帧续播。 */
+function setVisible(next) {
+  if (visible === next) return;
+  visible = next;
+  if (!visible) {
+    clearTimeout(timer);
+  } else if (pack?.animations?.[currentName]) {
+    schedule();
+  }
+}
+
 /** 订阅 daemon 推来的事件：显示指令与换包。 */
 async function watchEvents() {
   const { event } = window.__TAURI__;
   await event.listen('display', (e) => apply(e.payload));
+  await event.listen('pet-visibility', (e) => setVisible(e.payload === true));
   await event.listen('pet-changed', (e) => {
     usePack(e.payload);
     invoke('renderer_ready', {
@@ -168,6 +184,10 @@ async function watchEvents() {
 async function boot() {
   usePack(await invoke('pack_info'));
   window.addEventListener('resize', redraw);
+  // 兜底：系统层面的不可见（如最小化、被系统挂起）也停帧。
+  document.addEventListener('visibilitychange', () =>
+    setVisible(document.visibilityState === 'visible'),
+  );
   // 调试入口：控制台可 __pet.play('waving') / __pet.apply({animation:'idle'})
   window.__pet = {
     play,

@@ -14,8 +14,9 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use rodio::stream::DeviceSinkBuilder;
@@ -341,13 +342,49 @@ fn clamp_volume(volume: f32) -> f32 {
     volume.clamp(VOLUME_MIN, VOLUME_MAX)
 }
 
-/// 音频线程主循环：懒打开设备，之后每来一条命令播一次。
+/// 音效全部放完后，再安静多久就把音频设备关掉。
+///
+/// 设备一旦打开，系统音频回调就会持续地混音（哪怕只是静音），常驻进程里这是
+/// 一笔一直在付的 CPU；而提醒是零星的，按需打开、放完即关才划算。
+/// 留一点余量是为了连发几条提醒时不反复开关设备。
+const SINK_IDLE: Duration = Duration::from_secs(10);
+
+/// 音频线程主循环：懒打开设备，每来一条命令播一次，闲下来就关掉设备。
 fn run_audio_thread(rx: &mpsc::Receiver<Command>) {
     let mut sink: Option<MixerDeviceSink> = None;
-    for command in rx {
+    // 还在放的播放器。不再 `detach`：要靠它们判断「是不是都放完了」，
+    // 放完的会在每轮被清掉（`Player` 丢弃时其音源已空，不会掐断声音）。
+    let mut players: Vec<Player> = Vec::new();
+    loop {
+        let command = if sink.is_some() {
+            match rx.recv_timeout(SINK_IDLE) {
+                Ok(command) => Some(command),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        } else {
+            // 设备没开时没什么要等的，直接阻塞到下一条命令。
+            match rx.recv() {
+                Ok(command) => Some(command),
+                Err(_) => return,
+            }
+        };
+        players.retain(|player| !player.empty());
+
+        let Some(command) = command else {
+            // 安静了一整段：都放完了就关设备；还有长音效在放就再等一轮。
+            if players.is_empty() {
+                sink = None;
+            }
+            continue;
+        };
         if sink.is_none() {
             match DeviceSinkBuilder::open_default_sink() {
-                Ok(opened) => sink = Some(opened),
+                Ok(mut opened) => {
+                    // 关设备是本模块的常规动作，不需要 rodio 往 stderr 打提示。
+                    opened.log_on_drop(false);
+                    sink = Some(opened);
+                }
                 Err(error) => {
                     log::warn!("打开音频设备失败，本次不响：{error}");
                     continue;
@@ -356,24 +393,24 @@ fn run_audio_thread(rx: &mpsc::Receiver<Command>) {
         }
         // 上面刚保证过 `Some`；这里用 `if let` 而不是 `unwrap` 只是不想让 panic 留在音频线程上。
         if let Some(sink) = sink.as_ref() {
-            if let Err(error) = play_once(sink, &command) {
-                log::warn!("播放音效 {} 失败：{error:#}", command.path.display());
+            match play_once(sink, &command) {
+                Ok(player) => players.push(player),
+                Err(error) => log::warn!("播放音效 {} 失败：{error:#}", command.path.display()),
             }
         }
     }
 }
 
-/// 播一次并立刻脱手，不阻塞音频线程——多个音效连发时不会互相排队。
-fn play_once(sink: &MixerDeviceSink, command: &Command) -> Result<()> {
+/// 播一次并立刻返回，不阻塞音频线程——多个音效连发时不会互相排队。
+fn play_once(sink: &MixerDeviceSink, command: &Command) -> Result<Player> {
     let source = rodio::Decoder::try_from(File::open(&command.path)?)?;
     // 用 `Player` 而不是 `rodio::stream::play`：后者要求音源实现 `Seek`，
     // 而 `Decoder` 不实现。`append` 只要求 `Source`，正是我们要的粒度。
     let player = Player::connect_new(sink.mixer());
     player.set_volume(command.volume);
     player.append(source);
-    // 立刻脱手：音频线程要能马上接下一个音效，而不是等这一个放完。
-    player.detach();
-    Ok(())
+    // 交还给调用方持有：它要据此判断设备何时可以关。
+    Ok(player)
 }
 
 #[cfg(test)]
